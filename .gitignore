@@ -1,0 +1,26 @@
+# —— STM32CubeMX ——
+.mxproject
+
+# —— Keil MDK-ARM artifacts ——
+MDK-ARM/Listings/
+MDK-ARM/Objects/
+MDK-ARM/RTE/
+MDK-ARM/DebugConfig/
+*.uvguix.*
+*.uvoptx
+*.bak
+*.dep
+*.vix
+*.vfd
+*.htm
+*.lnp
+*.sct
+*.axf
+
+# —— Build outputs ——
+build/
+*.elf
+*.bin
+*.hex
+*.o
+*.d
