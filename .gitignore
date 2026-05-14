@@ -1,0 +1,17 @@
+# —— CMake build ——
+build/
+.cache/
+
+# —— Build outputs ——
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.d
+compile_commands.json
+
+# —— STM32CubeMX ——
+mx.scratch
+!.settings
