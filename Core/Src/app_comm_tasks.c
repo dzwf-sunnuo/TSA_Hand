@@ -1,4 +1,5 @@
 #include "app_comm_tasks.h"
+#include "cmsis_os2.h"
 #include "usart.h"
 #include "can.h"
 #include "rs485.h"
@@ -329,6 +330,14 @@ static void Can_ClearEncoders(void)
     Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
 }
 
+static void Can_WristPos(const App_CAN_Msg_t *msg)
+{
+    // 0x17 pos1_H pos1_L pos2_H pos2_L, 速度 3500=0x0DAC
+    vel_move(msg->data[1], msg->data[2], 0x0D, 0xAC);
+    osDelay(1);
+    vel_move1(msg->data[3], msg->data[4], 0x0D, 0xAC);
+}
+
 /* ================================================================
  *  手腕运动启停控制 (wrapper)
  *  所有调用方 (IR / CAN / Modbus / Action_Dispatch) 统一通过
@@ -519,6 +528,7 @@ void Task_CAN_Process_Entry(void *argument)
             // 直接硬件指令 (操作 Reg[] + 485 下发)
             if (msg.data[0] == 0x15) { Can_AllMotors(&msg);    continue; }
             if (msg.data[0] == 0x16) { Can_ClearEncoders();    continue; }
+            if (msg.data[0] == 0x17) { Can_WristPos(&msg);     continue; }
 
             // ===================================================
             //  动作消息: 纯映射 → 纯分发

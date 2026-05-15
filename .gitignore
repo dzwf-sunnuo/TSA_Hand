@@ -1,6 +1,8 @@
 # —— CMake build ——
 build/
 .cache/
+.vscode/
+.settings/
 
 # —— Build outputs ——
 *.elf
