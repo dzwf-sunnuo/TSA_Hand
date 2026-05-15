@@ -30,7 +30,6 @@ typedef enum {
 
     /* —— 手指单个动作 —— */
     ACTION_FINGER_SINGLE,           // 单个手势 (参数指定具体姿势编号)
-    ACTION_FINGER_DEBUG,            // 单关节调试 (param1: dir<<8|joint, param2: 圈数)
 
     /* —— 系统级 —— */
     ACTION_ALL_STOP,                // 全部停止 / 复位

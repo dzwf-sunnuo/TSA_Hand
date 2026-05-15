@@ -97,39 +97,6 @@ void Action_Dispatch(const ActionCmd_t *cmd)
         finger_single_action((uint16_t)cmd->param1);
         break;
 
-    case ACTION_FINGER_DEBUG: {
-        uint8_t  dir   = (uint8_t)(cmd->param1 >> 8);
-        uint8_t  joint = (uint8_t)(cmd->param1 & 0xFF);
-        uint16_t revs  = cmd->param2;
-        uint8_t  slave;
-        uint16_t *reg_base;
-        uint16_t *target_reg;
-
-        // 关节→从板: 1-3→ban1(Reg[4..6]), 4-7→ban2(Reg[9..12])
-        if (joint >= 1 && joint <= 3) {
-            slave    = 0x01;
-            reg_base = &Reg[4];
-        } else if (joint >= 4 && joint <= 7) {
-            slave    = 0x02;
-            reg_base = &Reg[9];
-        } else {
-            break;
-        }
-        target_reg = &reg_base[(joint <= 3) ? (joint - 1) : (joint - 4)];
-
-        int32_t cur = (int32_t)(*target_reg >> 8);
-        int32_t delta = (dir == 0x01) ? (int32_t)revs : -(int32_t)revs;
-        int32_t next = cur + delta;
-        if (next < 0)   next = 0;
-        if (next > 255) next = 255;
-
-        *target_reg = ((uint16_t)next << 8) | (*target_reg & 0xFF);
-
-        // 只发修改的从板，其余寄存器不动 → 其余关节不动
-        Host_write16_slave(slave, 0x10, 0x0000, 0x0005, 0x0A, reg_base);
-        break;
-    }
-
     /* —— 系统级 —— */
     case ACTION_ALL_STOP:
         // TODO: 全部停止
@@ -262,7 +229,11 @@ void IR_Key_MapToAction(uint16_t key_code, ActionCmd_t *cmd)
  *   data[0] = 0x13 → 手指单个动作
  *     子命令 (data[1..2]) = 手势编号
  *
- *   data[0] = 0x14 → 全部停止
+ *   data[0] = 0x14 → 手指单个动作 (data[1..2]=16位手势编号, 大端)
+ *
+ *   以下为直接硬件指令，在 Task_CAN_Process_Entry 中处理，不经过本函数:
+ *   data[0] = 0x15 → 全电机圈数 (data[1..7]=关节01-07)
+ *   data[0] = 0x16 → 编码器清零 (无附加数据)
  */
 void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
 {
@@ -305,11 +276,11 @@ void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
         break;
 
     case 0x12:   // 手指连续动作 (data[1..2]=16位子命令, 大端)
-        switch (subcmd) {
+        switch (subcmd) {/*
         case 0x0000: cmd->action = ACTION_ALL_STOP;                            break;
         case 0x0001: cmd->action = ACTION_FINGER_BEND;  cmd->param1 = msg->data[3]; cmd->param2 = 300;  break;
         case 0x0002: cmd->action = ACTION_FINGER_COUNT; cmd->param1 = msg->data[3]; cmd->param2 = 1300; break;
-        case 0x0003: cmd->action = ACTION_FINGER_FIST;  cmd->param1 = msg->data[3]; cmd->param2 = 1500; break;
+        case 0x0003: cmd->action = ACTION_FINGER_FIST;  cmd->param1 = msg->data[3]; cmd->param2 = 1500; break;*/
         }
         break;
 
@@ -323,12 +294,39 @@ void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
         cmd->param1 = subcmd;
         break;
 
-    case 0x15:   // 单关节调试 (data[1]=方向, data[2]=关节, data[3..4]=圈数大端)
-        cmd->action = ACTION_FINGER_DEBUG;
-        cmd->param1 = ((uint16_t)msg->data[1] << 8) | msg->data[2];  // 高8位方向, 低8位关节
-        cmd->param2 = ((uint16_t)msg->data[3] << 8) | msg->data[4];  // 圈数
-        break;
     }
+}
+
+/* ================================================================
+ *  CAN 直接硬件指令 (不走 Action_Dispatch)
+ *  0x15=全电机圈数, 0x16=编码器清零
+ * ================================================================ */
+
+static void Can_AllMotors(const App_CAN_Msg_t *msg)
+{
+    // data[1..7] = 关节 01-07 圈数, 速度 0x64, 正转
+    Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
+    Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
+    Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
+    Reg[7] = 0x0000;
+    Reg[8] = 0x0101;
+    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
+    osDelay(15);
+    Reg[9]  = ((uint16_t)msg->data[4] << 8) | 0x64;
+    Reg[10] = ((uint16_t)msg->data[5] << 8) | 0x64;
+    Reg[11] = ((uint16_t)msg->data[6] << 8) | 0x64;
+    Reg[12] = ((uint16_t)msg->data[7] << 8) | 0x64;
+    Reg[13] = 0x0101;
+    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
+}
+
+static void Can_ClearEncoders(void)
+{
+    Reg[4] = 0x0064; Reg[5] = 0x0064; Reg[6] = 0x0064; Reg[7] = 0x0000; Reg[8] = 0x0401;
+    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
+    osDelay(15);
+    Reg[9] = 0x0064; Reg[10] = 0x0064; Reg[11] = 0x0064; Reg[12] = 0x0064; Reg[13] = 0x0401;
+    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
 }
 
 /* ================================================================
@@ -507,13 +505,24 @@ void Task_CAN_Process_Entry(void *argument)
     {
         if (osMessageQueueGet(Queue_CAN_Rx, &msg, NULL, osWaitForever) == osOK)
         {
-            // 心跳检测：data[0]=0x00 → 回复 data[0]=0x01 (共用 CAN_HAND_ID)
-            if (msg.data[0] == CAN_HEARTBEAT_REQUEST)
-            {
+            // ===================================================
+            //  非动作消息: 心跳 / 直接硬件指令
+            //  直接处理，不进入 MapToAction → Dispatch 流程
+            // ===================================================
+
+            // 心跳
+            if (msg.data[0] == CAN_HEARTBEAT_REQUEST) {
                 MyCan_SendStdData(CAN_HAND_ID, &heartbeat_resp, 1);
                 continue;
             }
 
+            // 直接硬件指令 (操作 Reg[] + 485 下发)
+            if (msg.data[0] == 0x15) { Can_AllMotors(&msg);    continue; }
+            if (msg.data[0] == 0x16) { Can_ClearEncoders();    continue; }
+
+            // ===================================================
+            //  动作消息: 纯映射 → 纯分发
+            // ===================================================
             CAN_Msg_MapToAction(&msg, &cmd);
             Action_Dispatch(&cmd);
         }
