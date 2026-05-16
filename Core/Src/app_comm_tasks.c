@@ -233,8 +233,10 @@ void IR_Key_MapToAction(uint16_t key_code, ActionCmd_t *cmd)
  *   data[0] = 0x14 → 手指单个动作 (data[1..2]=16位手势编号, 大端)
  *
  *   以下为直接硬件指令，在 Task_CAN_Process_Entry 中处理，不经过本函数:
- *   data[0] = 0x15 → 全电机圈数 (data[1..7]=关节01-07)
- *   data[0] = 0x16 → 编码器清零 (无附加数据)
+ *   data[0] = 0x15 → 全电机正转 (data[1..7]=关节01-07圈数)
+ *   data[0] = 0x16 → 全电机反转 (data[1..7]=关节01-07圈数)
+ *   data[0] = 0x17 → 编码器清零 (无附加数据)
+ *   data[0] = 0x18 → 推杆电机定位 (data[1..4]=pos1H,pos1L,pos2H,pos2L)
  */
 void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
 {
@@ -300,12 +302,12 @@ void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
 
 /* ================================================================
  *  CAN 直接硬件指令 (不走 Action_Dispatch)
- *  0x15=全电机圈数, 0x16=编码器清零
+ *  0x15=全电机正转, 0x16=全电机反转, 0x17=编码器清零, 0x18=推杆定位
  * ================================================================ */
 
 static void Can_AllMotors(const App_CAN_Msg_t *msg)
 {
-    // data[1..7] = 关节 01-07 圈数, 速度 0x64, 正转
+    // data[1..7] = 关节 01-07 圈数, 速度 0x64, 正转 (mode=1)
     Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
     Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
     Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
@@ -321,6 +323,24 @@ static void Can_AllMotors(const App_CAN_Msg_t *msg)
     Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
 }
 
+static void Can_AllMotorsRev(const App_CAN_Msg_t *msg)
+{
+    // 同 0x15, mode=3 反转
+    Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
+    Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
+    Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
+    Reg[7] = 0x0000;
+    Reg[8] = 0x0301;
+    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
+    osDelay(15);
+    Reg[9]  = ((uint16_t)msg->data[4] << 8) | 0x64;
+    Reg[10] = ((uint16_t)msg->data[5] << 8) | 0x64;
+    Reg[11] = ((uint16_t)msg->data[6] << 8) | 0x64;
+    Reg[12] = ((uint16_t)msg->data[7] << 8) | 0x64;
+    Reg[13] = 0x0301;
+    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
+}
+
 static void Can_ClearEncoders(void)
 {
     Reg[4] = 0x0064; Reg[5] = 0x0064; Reg[6] = 0x0064; Reg[7] = 0x0000; Reg[8] = 0x0401;
@@ -332,7 +352,7 @@ static void Can_ClearEncoders(void)
 
 static void Can_WristPos(const App_CAN_Msg_t *msg)
 {
-    // 0x17 pos1_H pos1_L pos2_H pos2_L, 速度 3500=0x0DAC
+    // 0x18 pos1_H pos1_L pos2_H pos2_L, 速度 3500=0x0DAC
     vel_move(msg->data[1], msg->data[2], 0x0D, 0xAC);
     osDelay(1);
     vel_move1(msg->data[3], msg->data[4], 0x0D, 0xAC);
@@ -473,9 +493,8 @@ void Task_ModbusPC_Entry(void *argument)
             modbus2.reflag = 1;
             modbus2_Event();
 
-            if (pending_slave_dispatch > 0) {
-                osSemaphoreRelease(Sem_NewSlaveCmd);
-            }
+            // 每次收到有效 Modbus 帧都通知分发任务 (信号量替代了原来的 pending_slave_dispatch 全局变量)
+            osSemaphoreRelease(Sem_NewSlaveCmd);
 
             HAL_UARTEx_ReceiveToIdle_DMA(&huart2, modbus2.rcbuf, sizeof(modbus2.rcbuf));
         }
@@ -494,8 +513,6 @@ void Task_SlaveDispatch_Entry(void *argument)
         Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
         osDelay(15);
         Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
-
-        pending_slave_dispatch = 0;
     }
 }
 
@@ -527,8 +544,9 @@ void Task_CAN_Process_Entry(void *argument)
 
             // 直接硬件指令 (操作 Reg[] + 485 下发)
             if (msg.data[0] == 0x15) { Can_AllMotors(&msg);    continue; }
-            if (msg.data[0] == 0x16) { Can_ClearEncoders();    continue; }
-            if (msg.data[0] == 0x17) { Can_WristPos(&msg);     continue; }
+            if (msg.data[0] == 0x16) { Can_AllMotorsRev(&msg); continue; }
+            if (msg.data[0] == 0x17) { Can_ClearEncoders();    continue; }
+            if (msg.data[0] == 0x18) { Can_WristPos(&msg);     continue; }
 
             // ===================================================
             //  动作消息: 纯映射 → 纯分发

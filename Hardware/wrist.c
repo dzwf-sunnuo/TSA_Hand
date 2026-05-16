@@ -136,14 +136,15 @@ void updateSmartMotionControl(uint8_t mode, uint16_t cycle_time_ms)
         motion_direction = 0;  
         rotation_state = STATE_DOWN; 
         
-        /* 为了防止起始突变，初始速度给定最低速度，目标位置先给定一侧端点 */
+        /* 手腕初始位置在中心 (两个推杆均 ~8mm ≈ 0x0400)。
+           先定位于中心再启动 S 曲线，避免从中心向端点低速爬行的"卡顿"。 */
         if (current_mode == MODE_PENDULUM) {
-            vel_move((POS_PENDULUM_RIGHT_1 >> 8) & 0xFF, POS_PENDULUM_RIGHT_1 & 0xFF, (MIN_SPEED >> 8) & 0xFF, MIN_SPEED & 0xFF);
-            vel_move1((POS_PENDULUM_RIGHT_2 >> 8) & 0xFF, POS_PENDULUM_RIGHT_2 & 0xFF, (MIN_SPEED >> 8) & 0xFF, MIN_SPEED & 0xFF);
+            vel_move(0x04, 0x00, 0x07, 0xD0);   // pos=0x0400, speed=2000
+            vel_move1(0x04, 0x00, 0x07, 0xD0);
         }
         else if (current_mode == MODE_ROTATION) {
-            vel_move((POS_ROT_LEFT_1 >> 8) & 0xFF, POS_ROT_LEFT_1 & 0xFF, (MIN_SPEED >> 8) & 0xFF, MIN_SPEED & 0xFF);
-            vel_move1((POS_ROT_LEFT_2 >> 8) & 0xFF, POS_ROT_LEFT_2 & 0xFF, (MIN_SPEED >> 8) & 0xFF, MIN_SPEED & 0xFF);
+            vel_move(0x04, 0x00, 0x07, 0xD0);
+            vel_move1(0x04, 0x00, 0x07, 0xD0);
         }
         return;
     }

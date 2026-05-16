@@ -13,7 +13,6 @@ MODBUS modbus2; // 用于接收 PC 上位机的 MODBUS 结构体 (从机模式)
 
 uint16_t Reg[100] = {0}; // 模拟 Modbus 共享寄存器，16位数据存储区
 
-volatile uint8_t pending_slave_dispatch = 1; // 标志：是否有待处理的从机下发任务
 
 /**
  * @brief 发送单个字节数据到 USART2 (PC端)
@@ -87,11 +86,7 @@ void modbus2_Event()
                 case 16: modbus2_Func16(); break; // 写多寄存器
             }
             
-            /* 
-             * 【重点】：触发向下游手指驱动板的数据下发任务！
-             * 在 RTOS 架构下，我们不再使用状态机延时，只给上层 Task 传递标志。
-             */
-            pending_slave_dispatch = 1; 
+            // 有效帧已解析 → 上层 Task 会通过信号量触发分发
         }
     }
 

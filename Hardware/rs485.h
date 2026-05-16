@@ -27,7 +27,6 @@ typedef struct
 extern MODBUS modbus1;      /* 串口1：连接手指驱动板（主机模式） */
 extern MODBUS modbus2;      /* 串口2：连接PC上位机（从机模式） */
 extern uint16_t Reg[100];   /* 共享寄存器数组 */
-extern volatile uint8_t pending_slave_dispatch; /* 从机指令分发挂起标志 */
 
 /* 从机模式函数 (响应PC) */
 void modbus2_Init(void);
