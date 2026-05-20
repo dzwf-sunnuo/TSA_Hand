@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "can.h"
 #include "dma.h"
+#include "stm32f4xx_hal.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -30,6 +31,7 @@
 #include "app_comm_tasks.h" // 包含通信任务的头文件
 #include "rs485.h"        // 请取消注释以链接实际的硬件代码
 #include "Infrared1838.h" // 请取消注释以链接实际的硬件
+#include "wrist.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/

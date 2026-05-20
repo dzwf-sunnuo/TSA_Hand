@@ -431,6 +431,14 @@ void Task_WristMotion_Entry(void *argument)
         }
     }
 }
+//创建一个低优先级的任务用于打印调试信息
+void Task_DebugPrint_Entry(void *argument)
+{
+    for (;;)
+    {
+        // 在这里添加调试信息打印逻辑
+    }
+}
 
 /* ================================================================
  *  初始化
@@ -463,6 +471,9 @@ void App_Comm_Init(void)
 
     const osThreadAttr_t wrist_attr = { .name = "WristMotion", .stack_size = 512 * 4, .priority = osPriorityAboveNormal };
     osThreadNew(Task_WristMotion_Entry, NULL, &wrist_attr);
+
+    const osThreadAttr_t debug_attr = { .name = "DebugPrint", .stack_size = 512 * 4, .priority = osPriorityBelowNormal };
+    osThreadNew(Task_DebugPrint_Entry, NULL, &debug_attr);
 
     /* 4. 启动硬件 */
     HAL_UARTEx_ReceiveToIdle_DMA(&huart2, modbus2.rcbuf, sizeof(modbus2.rcbuf));
