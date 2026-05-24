@@ -113,9 +113,7 @@ int main(void)
   Modbus_Send_Byte('a'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
   Modbus_Init();  // MODBUS协议初始化（DMA+IDLE）
   Motor_Init();   // 电机初始化及 PID 参数设置
-  
-  extern uint16_t ADC_NativeValue[80]; // From freertos.c or main.c
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)ADC_NativeValue, 80);
+  // ADC DMA 由 vSensorProcessTask 按需启动, 不再在初始化时持续运行
   //printf("系统外设启动成功, 准备调度RTOS任务\r\n");
   /* USER CODE END 2 */
 

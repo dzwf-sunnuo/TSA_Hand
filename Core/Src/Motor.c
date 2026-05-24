@@ -332,3 +332,14 @@ float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
     return out;
 }
 
+//打印特定电机的目标出轴角度，当前出轴角度，目标速度，当前速度
+//（两个参数，第一个参数是电机索引，0-3，第二个是要看的参数，1对应目标出轴速度和当前出轴速度，2对应目标出轴角度和当前出轴角度）
+void Print_Motor_Status(uint8_t motor_index, uint8_t param)
+{
+    if (motor_index >= Motor_Num) return;
+    if (param == 1) {// 打印速度信息
+        printf("Motor %d Target Speed: %.2f RPM, Actual Speed: %.2f RPM\r\n", motor_index + 1, motor[motor_index].TargetSpeed, motor[motor_index].CurrentSpeed);
+    } else if (param == 2) {// 打印角度信息
+        printf("Motor %d Target Angle: %.2f deg, Actual Angle: %.2f deg\r\n", motor_index + 1, motor[motor_index].TargetAngle , motor[motor_index].CurrentAngle);
+    }
+}//用于调试，定期打印电机状态信息，观察 PID 收敛情况和系统响应特性

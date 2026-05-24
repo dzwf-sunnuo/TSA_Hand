@@ -19,7 +19,6 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
-#include "cmsis_os2.h"
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
@@ -50,13 +49,14 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-uint16_t ADC_NativeValue[80] = {0}; // 原始 AD 采样值
-uint16_t ADC_SumValue[4] = {0};     // 累加器
+uint16_t ADC_NativeValue[80] = {0}; // DMA 目标缓冲区 (单次模式)
+uint16_t ADC_Snapshot[80] = {0};    // 完成回调中拷贝的快照
 
 osMutexId_t xMotorDataMutexHandle;
 const osMutexAttr_t xMotorDataMutex_attributes = {
   .name = "xMotorDataMutex"
 };
+osSemaphoreId_t Sem_ADC_Done;  // DMA 单次采集完成信号
 
 osThreadId_t motorControlTaskHandle;
 const osThreadAttr_t motorControlTask_attributes = {
@@ -75,14 +75,14 @@ const osThreadAttr_t modbusCommTask_attributes = {
 osThreadId_t sensorProcessTaskHandle;
 const osThreadAttr_t sensorProcessTask_attributes = {
   .name = "sensorProcessTask",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
 osThreadId_t systemMonitorTaskHandle;
 const osThreadAttr_t systemMonitorTask_attributes = {
   .name = "systemMonitorTask",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE END Variables */
@@ -90,8 +90,8 @@ const osThreadAttr_t systemMonitorTask_attributes = {
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -121,7 +121,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
+  Sem_ADC_Done = osSemaphoreNew(1, 0, NULL);  // DMA 单次完成
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -226,30 +226,109 @@ void vModbusCommTask(void *argument)
   }
 }
 
+/* ================================================================
+ *  快速排序 (uint16_t)
+ *
+ *  标准 Hoare 分区方案。对 20 个元素的小数组, 快速排序
+ * 
+ *
+ *  调用: quicksort(arr, 0, n-1)
+ * ================================================================ */
+
+static void swap_u16(uint16_t *a, uint16_t *b)
+{
+    uint16_t t = *a;
+    *a = *b;
+    *b = t;
+}
+
 /**
-  * @brief 传感器处理任务 (普通优先级)
-  * @param argument: 未使用
-  * @retval None
-  * @note 处理 ADC 多通道数据的滤波
-  */
+ * @brief 分区: 以最右元素为 pivot, 小于 pivot 的放左边, 大于的放右边
+ * @return pivot 最终位置
+ */
+static int partition(uint16_t *arr, int left, int right)
+{
+    uint16_t pivot = arr[right];  // 选最右元素为基准
+    int i = left - 1;             // i 指向"小于区"的尾部
+
+    for (int j = left; j < right; j++) {
+        if (arr[j] <= pivot) {
+            i++;
+            swap_u16(&arr[i], &arr[j]);
+        }
+    }
+    swap_u16(&arr[i + 1], &arr[right]);  // pivot 归位
+    return i + 1;
+}
+
+/**
+ * @brief 快速排序 (递归)
+ * @param arr   待排序数组
+ * @param left  左边界 (含)
+ * @param right 右边界 (含)
+ */
+static void quicksort(uint16_t *arr, int left, int right)
+{
+    if (left >= right) return;
+
+    int pivot_idx = partition(arr, left, right);
+
+    quicksort(arr, left, pivot_idx - 1);   // 排左边
+    quicksort(arr, pivot_idx + 1, right);  // 排右边
+}
+
+/**
+ * @brief 传感器处理任务 (普通优先级)
+ *
+ * 每 10ms 启动一次 ADC DMA 单次采集 (4 通道 × 20 样本),
+ * 等待完成回调 → 快速排序 + 裁剪均值滤波 → 写入 ADC_HallValue[]。
+ *
+ * DMA 为单次模式, 仅在采集期间运行 (~152μs), 其余时间 ADC 空闲。
+ */
 void vSensorProcessTask(void *argument)
 {
+  uint16_t local[80];
+  uint16_t sorted[20];
   uint8_t i, j;
+  uint32_t sum;
+
   for(;;)
   {
-    // 20ms 周期执行滤波处理，不需要极高的实时性
-    osDelay(20);
-    // 关节 AD 值采集与平均滤波（每个通道 20次 采样取平均）
-    for(j = 0; j < 4; j++) {
-      for(i = 0; i < 20; i++) {
-        ADC_SumValue[j] += ADC_NativeValue[4*i + j];
-      }
-      ADC_HallValue[j] = ADC_SumValue[j] / 20;
-      ADC_SumValue[j] = 0;
+    // 启动单次 DMA 采集 (4 通道 × 20 样本 ≈ 152μs)
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)ADC_NativeValue, 80);
+
+    // 等待 DMA 完成 (超时 50ms 为安全兜底)
+    if (osSemaphoreAcquire(Sem_ADC_Done, 50) != osOK) {
+      HAL_ADC_Stop_DMA(&hadc1);
+      continue;
     }
+
+    // 拷贝快照到本地栈
+    for (i = 0; i < 80; i++) {
+      local[i] = ADC_Snapshot[i];
+    }
+
+    for (j = 0; j < 4; j++) {
+
+      for (i = 0; i < 20; i++) {
+        sorted[i] = local[4 * i + j];
+      }
+
+      quicksort(sorted, 0, 19);
+
+      // 裁剪均值: 去头尾各 4, 中间 12 取平均
+      sum = 0;
+      for (i = 4; i < 16; i++) {
+        sum += sorted[i];
+      }
+      ADC_HallValue[j] = (uint16_t)(sum / 12);
+    }
+
+    osDelay(5);  // 5ms 后进入下一轮采集
   }
 }
 
+static char pcwritebuff[256]; // 用于打印任务栈大小的缓冲区
 /**
   * @brief 系统监视及低频定时任务 (低优先级)
   * @param argument: 未使用
@@ -259,21 +338,35 @@ void vSensorProcessTask(void *argument)
 void vSystemMonitorTask(void *argument)
 {
   uint32_t PreviousWakeTime = osKernelGetTickCount();
-  int i = 3; // 监视电机 i-1 的状态
+  //int i = 3; // 监视电机 i-1 的状态
   for(;;)
   {
-    // 20ms 的 Modbus 定时节拍器
-    osDelayUntil(PreviousWakeTime + 20); 
-    PreviousWakeTime = osKernelGetTickCount();
+    // 200ms 的 Modbus 定时节拍器
+    osDelayUntil(PreviousWakeTime + 200); 
     /*打印电机1的目标速度，实际速度，目标位置，实际位置*/
-   // printf("Motor 1 Target Speed: %d, Actual Speed: %d\r\n", (int)motor[i].TargetSpeed, (int)motor[i].CurrentSpeed);
-   // printf("Motor 1 Target Angle: %d, Actual Angle: %d\r\n", (int)motor[i].TargetAngle, (int)motor[i].CurrentAngle);
-    printf("%d,%d,%d,%d\r\n", 0xff,(int)motor[i].TargetAngle, (int)motor[i].CurrentAngle,0xfe);// 以特定格式打印电机状态，方便上位机解析
-
+    vTaskList(pcwritebuff);
+    printf("Task List:\r\n%s\r\n", pcwritebuff);
+   //Print_Motor_Status(i, 1); // 打印速度状态
     Modbus_Timer_Loop(); // 更新 Modbus 超时接收和 1s 定时发送计时器，其实超时接收已经被IDLE中断回调处理了
+    PreviousWakeTime = osKernelGetTickCount();
+
   }
 }
 /* USER CODE END Application */
 
+/**
+ * @brief ADC DMA 完成回调 — 快照 + 信号量唤醒
+ *
+ * DMA 单次模式, 由 vSensorProcessTask 启动, 完成后触发此回调。
+ * 频率 = 任务频率 (10ms → 100 Hz), 不会淹没调度器。
+ */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance != ADC1) return;
 
+    for (int i = 0; i < 80; i++) {
+        ADC_Snapshot[i] = ADC_NativeValue[i];
+    }
+    osSemaphoreRelease(Sem_ADC_Done);
+}
 
