@@ -4,6 +4,10 @@
 #include "usart.h"
 #include "rs485.h"
 
+/* 堵转保护 */
+#define STALL_TIMEOUT_TICKS  300     // 3 秒 (10ms/tick)
+#define STALL_ANGLE_THRESHOLD  (Real_OneTurn * 1.02f)  // 1 圈 = ~7.3 编码器计数
+
 /**
  * @brief 硬件配置映射表
  * 
@@ -97,20 +101,26 @@ void Motor_Init(void)
     for (int i = 0; i < Motor_Num; i++) {
         motor[i].CurrentAngle = 0.0f;
         motor[i].CurrentSpeed = 0.0f;
-        
+
+        // 角度环: 输出 TargetSpeed, 范围 ±12750 (50rpm × 255%)
         PID_Angle[i].Kp = Kp_Angle[i];
         PID_Angle[i].Ki = Ki_Angle[i];
         PID_Angle[i].Kd = Kd_Angle[i];
         PID_Angle[i].Error_Last1 = 0.0f;
         PID_Angle[i].Error_Last2 = 0.0f;
         PID_Angle[i].Out_Last = 0.0f;
+        PID_Angle[i].OutMin = -12750.0f;
+        PID_Angle[i].OutMax =  12750.0f;
 
+        // 速度环: 输出 PWM 占空比, 范围 ±1000 (匹配 int16_t 安全范围)
         PID_Speed[i].Kp = Kp_Speed[i];
         PID_Speed[i].Ki = Ki_Speed[i];
         PID_Speed[i].Kd = Kd_Speed[i];
         PID_Speed[i].Error_Last1 = 0.0f;
         PID_Speed[i].Error_Last2 = 0.0f;
         PID_Speed[i].Out_Last = 0.0f;
+        PID_Speed[i].OutMin = -1000.0f;
+        PID_Speed[i].OutMax =  1000.0f;
     }
 
     for (int i = 0; i < Hall_Num; i++) {
@@ -120,6 +130,8 @@ void Motor_Init(void)
         PID_Position[i].Error_Last1 = 0.0f;
         PID_Position[i].Error_Last2 = 0.0f;
         PID_Position[i].Out_Last = 0.0f;
+        PID_Position[i].OutMin = -12750.0f;
+        PID_Position[i].OutMax =  12750.0f;
     }
 }
 
@@ -150,15 +162,42 @@ void Motor_Control_Loop(void)
         uint8_t mode = Reg[4] >> 8;     // 从 Modbus 寄存器 Reg[4] 高 8 位获取运动模式
         uint8_t io_flag = Reg[4] & 0xFF; // 从 Modbus 寄存器 Reg[4] 低 8 位获取启停标志
 
+        /* 堵转保护状态 (跨调用保持) */
+        static uint16_t stall_timer[Motor_Num] = {0};
+        static float    stall_target[Motor_Num] = {0};
+
         for (int i = 0; i < Motor_Num; i++) {
             /* 2.1 状态采集 (已优化：单词读取 delta 确保速度/位置同步) */
             int16_t delta = (int16_t)__HAL_TIM_GET_COUNTER(motor_hw_map[i].enc_tim);
             __HAL_TIM_SET_COUNTER(motor_hw_map[i].enc_tim, 0);
 
             motor[i].IOFlag = io_flag;
-            motor[i].CurrentAngle += (float)delta * ANGLE_CONV_FACTOR;   // 累加计算当前出轴总角度
-            motor[i].CurrentSpeed = (float)delta * SPEED_CONV_FACTOR;     // 计算当前瞬时转速 (RPM)
-            motor[i].CurrentPosition = (float)ADC_HallValue[i];           // 获取当前关节传感器值
+            motor[i].CurrentAngle += (float)delta * ANGLE_CONV_FACTOR;
+            motor[i].CurrentSpeed = (float)delta * SPEED_CONV_FACTOR;
+            motor[i].CurrentPosition = (float)ADC_HallValue[i];
+
+            /* ---- 堵转保护 ---- */
+            if (io_flag && mode != 4) {
+                // 目标变化 → 重置计时
+                if (motor[i].TargetAngle != stall_target[i]) {
+                    stall_target[i] = motor[i].TargetAngle;
+                    stall_timer[i] = 0;
+                }
+                // 误差超阈值 → 累加堵转计时
+                float err = motor[i].TargetAngle - motor[i].CurrentAngle;
+                if (err < 0) err = -err;
+                if (err > STALL_ANGLE_THRESHOLD) {
+                    if (++stall_timer[i] >= STALL_TIMEOUT_TICKS) {
+                        // 堵转确认: 清除目标圈数, PID 自动回零
+                        Reg[i] &= 0x00FF;   // 保留低 8 位速度, 圈数清零
+                        stall_timer[i] = 0;
+                    }
+                } else {
+                    stall_timer[i] = 0;  // 在接近目标, 重置
+                }
+            } else {
+                stall_timer[i] = 0;
+            }
 
             /* 2.2 外环计算 (位置环/角度环) */
             switch (mode) {
@@ -168,9 +207,9 @@ void Motor_Control_Loop(void)
                     float sign = (mode == 1) ? 1.0f : -1.0f;
                     motor[i].TargetAngle = sign * Real_OneTurn * (float)(Reg[i] >> 8);
                     
-                    // 软限位：限制最大转动圈数为 50 圈
-                    if (motor[i].TargetAngle > Real_OneTurn * 50.0f) motor[i].TargetAngle = Real_OneTurn * 50.0f;
-                    if (motor[i].TargetAngle < -Real_OneTurn * 50.0f) motor[i].TargetAngle = -Real_OneTurn * 50.0f;
+                    // 软限位：限制最大转动圈数为 40 圈
+                    if (motor[i].TargetAngle > Real_OneTurn * 40.0f) motor[i].TargetAngle = Real_OneTurn * 40.0f;
+                    if (motor[i].TargetAngle < -Real_OneTurn * 40.0f) motor[i].TargetAngle = -Real_OneTurn * 40.0f;
 
                     // 计算角度环输出 -> 得到目标速度
                     motor[i].TargetSpeed = PID_Increment(&PID_Angle[i], motor[i].CurrentAngle, motor[i].TargetAngle);
@@ -200,7 +239,7 @@ void Motor_Control_Loop(void)
 
                     // 死区处理：ADC 误差在 5 以内则停止
                     if (PID_Position[i].Error_Last1 <= 5.0f && PID_Position[i].Error_Last1 >= -5.0f) motor[i].TargetSpeed = 0.0f;
-                    // 安全保护：若电机转动超过 40 圈则强制停止以防拉断钢丝
+                    // 安全保护：若电机转动超过 40 圈则强制停止以防拉断
                     if (motor[i].CurrentAngle < -40.0f * Real_OneTurn || motor[i].CurrentAngle > 40.0f * Real_OneTurn) motor[i].TargetSpeed = 0.0f;
                     break;
                 }
@@ -317,18 +356,21 @@ float lineInterp(float xa[], float ya[], int length, float data, int flag)
  */
 float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
 {
-    float err = Target - Current; // 计算当前误差
-    float proportion = err - PID->Error_Last1; // 比例项：E(k) - E(k-1)
-    float differential = err - 2.0f * PID->Error_Last1 + PID->Error_Last2; // 微分项：E(k) - 2E(k-1) + E(k-2)
-    
-    // 增量公式：ΔU = Kp * (E(k)-E(k-1)) + Ki * E(k) + Kd * (E(k)-2E(k-1)+E(k-2))
+    float err = Target - Current;
+    float proportion = err - PID->Error_Last1;
+    float differential = err - 2.0f * PID->Error_Last1 + PID->Error_Last2;
+
     float out = PID->Out_Last + PID->Kp * proportion + PID->Ki * err + PID->Kd * differential;
 
-    /* 更新历史状态 */
+    // 抗积分饱和: Out_Last 必须钳位在输出限幅范围内, 否则堵转时
+    // 积分项持续累加, float→int16_t 转换时溢出回绕导致电机反转
+    if (out > PID->OutMax)  out = PID->OutMax;
+    if (out < PID->OutMin)  out = PID->OutMin;
+
     PID->Error_Last2 = PID->Error_Last1;
     PID->Error_Last1 = err;
     PID->Out_Last = out;
-    
+
     return out;
 }
 

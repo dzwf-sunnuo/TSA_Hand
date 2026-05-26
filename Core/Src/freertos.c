@@ -90,7 +90,7 @@ const osThreadAttr_t systemMonitorTask_attributes = {
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 512 * 4,
+  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -353,20 +353,4 @@ void vSystemMonitorTask(void *argument)
   }
 }
 /* USER CODE END Application */
-
-/**
- * @brief ADC DMA 完成回调 — 快照 + 信号量唤醒
- *
- * DMA 单次模式, 由 vSensorProcessTask 启动, 完成后触发此回调。
- * 频率 = 任务频率 (10ms → 100 Hz), 不会淹没调度器。
- */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc->Instance != ADC1) return;
-
-    for (int i = 0; i < 80; i++) {
-        ADC_Snapshot[i] = ADC_NativeValue[i];
-    }
-    osSemaphoreRelease(Sem_ADC_Done);
-}
 

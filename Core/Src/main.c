@@ -31,6 +31,7 @@
 #include "stdio.h"
 #include "Motor.h"
 #include "rs485.h"
+#include "power_loss.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -83,7 +84,10 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  // 保持调试接口在 MCU 睡眠/停止/待机模式下仍可连接
+  HAL_DBGMCU_EnableDBGSleepMode();
+  HAL_DBGMCU_EnableDBGStopMode();
+  HAL_DBGMCU_EnableDBGStandbyMode();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -113,6 +117,16 @@ int main(void)
   Modbus_Send_Byte('a'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
   Modbus_Init();  // MODBUS协议初始化（DMA+IDLE）
   Motor_Init();   // 电机初始化及 PID 参数设置
+
+  // 掉电恢复: 从 Flash 读取上次断电时的电机角度, 自主回零
+  float saved_angles[4];
+  PL_Init(saved_angles);
+  for (int i = 0; i < Motor_Num; i++) {
+      motor[i].CurrentAngle = saved_angles[i];  // 恢复断电前位置
+      Reg[i] = 0x0064;                           // 目标 0 圈 + 速度 100%
+  }
+  Reg[4] = 0x0101;  // mode=1 (角度控制), io_flag=1 (使能)
+
   // ADC DMA 由 vSensorProcessTask 按需启动, 不再在初始化时持续运行
   //printf("系统外设启动成功, 准备调度RTOS任务\r\n");
   /* USER CODE END 2 */

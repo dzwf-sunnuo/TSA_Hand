@@ -10,7 +10,7 @@
 
 #define MODBUS_BUF_SIZE 100
 
-#define RS485_SLAVE_ADDR 0x01 // 从机地址（可根据需要修改）
+#define RS485_SLAVE_ADDR 0x02 // 从机地址（可根据需要修改）
 
 // MODBUS 协议-参数结构体
 typedef struct

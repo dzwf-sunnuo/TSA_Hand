@@ -47,6 +47,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/Motor.c
     Core/Src/rs485.c
     Core/Src/rs485_crc.c
+    Core/Src/power_loss.c
 )
 
 # Add include paths

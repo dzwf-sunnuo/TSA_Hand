@@ -39,6 +39,7 @@ typedef struct _PID_Increment_Struct
     float Error_Last1;          // 上一次误差 E(k-1)
     float Error_Last2;          // 上上次误差 E(k-2)
     float Out_Last;             // 上一次的控制器输出 U(k-1)
+    float OutMin, OutMax;       // 输出限幅 (抗积分饱和)
 } PID_Increment_Struct;
 
 /**
