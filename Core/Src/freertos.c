@@ -28,6 +28,7 @@
 #include "Motor.h"
 #include "rs485.h"
 #include "adc.h"
+#include "power_loss.h"
 #include "stdio.h"
 #include <stdint.h>
 /* USER CODE END Includes */
@@ -57,6 +58,10 @@ const osMutexAttr_t xMotorDataMutex_attributes = {
   .name = "xMotorDataMutex"
 };
 osSemaphoreId_t Sem_ADC_Done;  // DMA 单次采集完成信号
+osTimerId_t powerLossInitTimerHandle;
+const osTimerAttr_t powerLossInitTimer_attributes = {
+  .name = "powerLossInitTimer"
+};
 
 osThreadId_t motorControlTaskHandle;
 const osThreadAttr_t motorControlTask_attributes = {
@@ -100,6 +105,7 @@ void vMotorControlTask(void *argument);
 void vModbusCommTask(void *argument);
 void vSensorProcessTask(void *argument);
 void vSystemMonitorTask(void *argument);
+void PowerLossInitTimerCallback(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -125,7 +131,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
+  powerLossInitTimerHandle = osTimerNew(PowerLossInitTimerCallback, osTimerOnce, NULL, &powerLossInitTimer_attributes);
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -159,6 +165,9 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
+  if (powerLossInitTimerHandle != NULL) {
+    osTimerStart(powerLossInitTimerHandle, 1000U);
+  }
   vTaskDelete(NULL); // 删除默认任务，没这个默认任务cubeMX报错
   /* Infinite loop */
   for(;;)
@@ -191,6 +200,7 @@ void vMotorControlTask(void *argument)
      // i = osKernelGetTickCount();
       osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
       Motor_Control_Loop(); // 执行电机位置/速度内环闭环计算并输出PWM
+      PL_SaveAngles();        // 将当前角度写入备份寄存器 (双槽交替, ~30μs)
       osMutexRelease(xMotorDataMutexHandle);
      /* i = osKernelGetTickCount() - i;
       j++;
@@ -352,5 +362,35 @@ void vSystemMonitorTask(void *argument)
 
   }
 }
+
+
+  /**
+    * @brief 掉电恢复延迟初始化定时器回调
+    * @param argument: 未使用
+    * @retval None
+    */
+  void PowerLossInitTimerCallback(void *argument)
+  {
+    float saved_angles[Motor_Num] = {0.0f};
+
+    (void)argument;
+
+    PL_Init(saved_angles);
+
+    if (xMotorDataMutexHandle != NULL) {
+      if (osMutexAcquire(xMotorDataMutexHandle, 100) == osOK) {
+        for (int i = 0; i < Motor_Num; i++) {
+          motor[i].CurrentAngle = saved_angles[i];
+          motor[i].TargetAngle = 0.0f;
+          motor[i].TargetSpeed = 0.0f;
+          Reg[i] = 0x0064;
+        }
+        //Modbus_Send_Byte('c'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
+        Reg[4] = 0x0101;
+        osMutexRelease(xMotorDataMutexHandle);
+      }
+    }
+  }
+
 /* USER CODE END Application */
 

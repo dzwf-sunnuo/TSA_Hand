@@ -118,15 +118,6 @@ int main(void)
   Modbus_Init();  // MODBUS协议初始化（DMA+IDLE）
   Motor_Init();   // 电机初始化及 PID 参数设置
 
-  // 掉电恢复: 从 Flash 读取上次断电时的电机角度, 自主回零
-  float saved_angles[4];
-  PL_Init(saved_angles);
-  for (int i = 0; i < Motor_Num; i++) {
-      motor[i].CurrentAngle = saved_angles[i];  // 恢复断电前位置
-      Reg[i] = 0x0064;                           // 目标 0 圈 + 速度 100%
-  }
-  Reg[4] = 0x0101;  // mode=1 (角度控制), io_flag=1 (使能)
-
   // ADC DMA 由 vSensorProcessTask 按需启动, 不再在初始化时持续运行
   //printf("系统外设启动成功, 准备调度RTOS任务\r\n");
   /* USER CODE END 2 */

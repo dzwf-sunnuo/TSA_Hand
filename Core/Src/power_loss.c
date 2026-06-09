@@ -1,87 +1,88 @@
 #include "power_loss.h"
 #include "Motor.h"
-#include "rs485.h"
 #include "rs485_crc.h"
 #include "stm32f4xx_hal.h"
 #include <string.h>
 
-// 记录在 Flash 中的格式 (20 字节)
-typedef struct __attribute__((packed)) {
-    uint16_t magic;     // 0x5AA5
-    uint16_t crc;       // CRC16 校验 (覆盖 angles[4])
-    float    angles[4]; // 4 路电机出轴角度
-} PL_Record_t;
+// 备份寄存器指针基址 (BKP0R~BKP19R 在 RTC 外设内, 地址连续)
+static __IO uint32_t *const bkp = &RTC->BKP0R;
 
-static uint32_t pl_write_offset;  // 下次写入的扇区内偏移
+static uint32_t pl_seq = 0;   // 递增序号
+static int pl_toggle = 0;     // 0→下一帧写槽A, 1→下一帧写槽B
 
 // ================================================================
-//  Flash 辅助函数
+//  备份寄存器读写辅助
 // ================================================================
 
-// 计算 angles[4] 的 CRC16
-static uint16_t pl_calc_crc(const float *angles)
+// seq 回绕安全比较: (int32_t)(a - b) > 0 ⇔ a 比 b 新
+static inline int pl_seq_gt(uint32_t a, uint32_t b)
 {
-    return Modbus_CRC16((uint8_t *)angles, 4 * sizeof(float));
+    return (int32_t)(a - b) > 0;
 }
 
-// 从扇区扫描: 找到最后一条有效的记录, 返回其偏移 (0 表示无效)
-static uint32_t pl_find_last_record(void)
+// CRC 覆盖 6 个 32 位字: magic + seq + angle[0..3]
+static uint16_t pl_calc_slot_crc(const uint32_t data[6])
 {
-    uint32_t last_valid = 0;
-    PL_Record_t rec;
+    return Modbus_CRC16((const uint8_t *)data, 6 * sizeof(uint32_t));
+}
 
-    for (uint32_t off = 0; off < PL_FLASH_SIZE; off += PL_RECORD_SIZE) {
-        // 跳过未写入区 (全 0xFF)
-        uint16_t *magic_ptr = (uint16_t *)(PL_FLASH_ADDR + off);
-        if (*magic_ptr == 0xFFFF) continue;
+// ================================================================
+//  双槽读写
+// ================================================================
 
-        // 读取记录
-        memcpy(&rec, (void *)(PL_FLASH_ADDR + off), sizeof(PL_Record_t));
+// 读一槽: 校验 commit → magic → CRC, 通过后输出 angles
+// 返回 0=有效, -1=无效
+static int pl_read_slot(uint32_t base, float angles_out[4])
+{
+    // commit 是最后一个写入的字, 如果缺失说明掉电时未写完
+    if (bkp[base + PL_OFF_COMMIT] != PL_COMMIT) return -1;
+    if (bkp[base + PL_OFF_MAGIC]  != PL_MAGIC)   return -1;
 
-        if (rec.magic != PL_MAGIC) continue;
-
-        uint16_t calc_crc = pl_calc_crc(rec.angles);
-        if (calc_crc == rec.crc) {
-            last_valid = off;
-        }
+    // 组装 CRC 输入: magic + seq + 4×angle
+    uint32_t crc_in[6];
+    for (int i = 0; i < 6; i++) {
+        crc_in[i] = bkp[base + i];
     }
-    return last_valid;
+    uint16_t calc = pl_calc_slot_crc(crc_in);
+    uint16_t stored = (uint16_t)(bkp[base + PL_OFF_CRC] & 0xFFFF);
+    if (calc != stored) return -1;
+
+    // 恢复角度 (float 原始位 → float)
+    for (int i = 0; i < 4; i++) {
+        uint32_t bits = bkp[base + PL_OFF_ANGLE0 + i];
+        memcpy(&angles_out[i], &bits, sizeof(float));
+    }
+    return 0;
 }
 
-// 擦除备份扇区 (仅在扇区写满时调用, 发生在 main 初始化阶段, 时间充裕)
-static void pl_erase_sector(void)
+// 写一槽: 按顺序写入, commit 最后 (保证原子性)
+static void pl_write_slot(uint32_t base, uint32_t seq, const float angles[4])
 {
-    __disable_irq();
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR |
-                           FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR |
-                           FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+    uint32_t crc_in[6];
 
-    FLASH_EraseInitTypeDef erase_cfg = {
-        .TypeErase    = FLASH_TYPEERASE_SECTORS,
-        .Sector       = PL_FLASH_SECTOR,
-        .NbSectors    = 1,
-        .VoltageRange = FLASH_VOLTAGE_RANGE_3,
-    };
-    uint32_t sector_err = 0;
-    HAL_FLASH_Unlock();
-    HAL_FLASHEx_Erase(&erase_cfg, &sector_err);
-    HAL_FLASH_Lock();
-    __enable_irq();
+    crc_in[0] = PL_MAGIC;
+    crc_in[1] = seq;
+    for (int i = 0; i < 4; i++) {
+        memcpy(&crc_in[2 + i], &angles[i], sizeof(float));
+    }
+    uint16_t crc = pl_calc_slot_crc(crc_in);
 
-    pl_write_offset = 0;
-}
+    // 使能备份域写权限
+    HAL_PWR_EnableBkUpAccess();
 
-// 使指定偏移处的记录失效 (清除 magic 字段, Flash 半字写入 ~30μs)
-static void pl_invalidate_record(uint32_t offset)
-{
-    __disable_irq();
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR |
-                           FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR |
-                           FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
-    HAL_FLASH_Unlock();
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, PL_FLASH_ADDR + offset, 0x0000);
-    HAL_FLASH_Lock();
-    __enable_irq();
+    // 写入前先把 commit 标记为无效，防止写到一半被判为已提交
+    bkp[base + PL_OFF_COMMIT]  = PL_COMMIT_INVALID;
+
+    // 顺序写入, commit 必须最后
+    bkp[base + PL_OFF_MAGIC]   = PL_MAGIC;
+    bkp[base + PL_OFF_SEQ]     = seq;
+    bkp[base + PL_OFF_ANGLE0]  = crc_in[2];
+    bkp[base + PL_OFF_ANGLE0+1]= crc_in[3];
+    bkp[base + PL_OFF_ANGLE0+2]= crc_in[4];
+    bkp[base + PL_OFF_ANGLE0+3]= crc_in[5];
+    bkp[base + PL_OFF_CRC]     = ((uint32_t)PL_VERSION << 16) | crc;
+    // 最后写入 commit, 掉电发生在此之前 → 该槽校验失败, 对侧槽仍然有效
+    bkp[base + PL_OFF_COMMIT]  = PL_COMMIT;
 }
 
 // ================================================================
@@ -89,40 +90,62 @@ static void pl_invalidate_record(uint32_t offset)
 // ================================================================
 void PL_Init(float angles_out[4])
 {
-    // 配置 PVD: 2.9V 下降沿触发中断 (VDD 从 3.3V 跌落时触发)
+    // 配置 PVD: 2.9V 下降沿触发中断 (掉电时紧急刹停)
     PWR_PVDTypeDef sConfigPVD = {0};
-    sConfigPVD.PVDLevel = PWR_PVDLEVEL_5;          // 阈值 2.9V
+    sConfigPVD.PVDLevel = PWR_PVDLEVEL_7;          // 阈值 2.9V
     sConfigPVD.Mode    = PWR_PVD_MODE_IT_FALLING;   // 仅下降沿触发
     HAL_PWR_ConfigPVD(&sConfigPVD);
     HAL_PWR_EnablePVD();
 
-    // 默认值
     memset(angles_out, 0, 4 * sizeof(float));
 
-    uint32_t off = pl_find_last_record();
-    if (off >= PL_FLASH_SIZE) {
-        // 无有效记录, 从头开始写 (扇区为出厂全 FF 或已全部失效)
-        pl_write_offset = 0;
-        return;
+    float slot_a[4], slot_b[4];
+    int va = pl_read_slot(PL_SLOT_A_BASE, slot_a);
+    int vb = pl_read_slot(PL_SLOT_B_BASE, slot_b);
+
+    if (va == 0 && vb == 0) {
+        // 两槽均有效 → 比 seq 选更新的
+        uint32_t seq_a = bkp[PL_SLOT_A_BASE + PL_OFF_SEQ];
+        uint32_t seq_b = bkp[PL_SLOT_B_BASE + PL_OFF_SEQ];
+        if (pl_seq_gt(seq_a, seq_b)) {
+            memcpy(angles_out, slot_a, sizeof(slot_a));
+            pl_seq = seq_a + 1;
+        } else {
+            memcpy(angles_out, slot_b, sizeof(slot_b));
+            pl_seq = seq_b + 1;
+        }
+        // 下一帧写到较旧的那个槽 (如果 A 新则 A 刚被读过, 写 B)
+        pl_toggle = pl_seq_gt(seq_a, seq_b) ? 1 : 0;
+    } else if (va == 0) {
+        memcpy(angles_out, slot_a, sizeof(slot_a));
+        pl_seq = bkp[PL_SLOT_A_BASE + PL_OFF_SEQ] + 1;
+        pl_toggle = 1;  // 槽 A 有数据, 下一帧写槽 B
+    } else if (vb == 0) {
+        memcpy(angles_out, slot_b, sizeof(slot_b));
+        pl_seq = bkp[PL_SLOT_B_BASE + PL_OFF_SEQ] + 1;
+        pl_toggle = 0;  // 槽 B 有数据, 下一帧写槽 A
+    } else {
+        // 两槽都无效 (首次上电 / VBAT 掉过)
+        pl_seq = 0;
+        pl_toggle = 0;
+    }
+}
+
+// ================================================================
+//  周期保存 (在 10ms 电机控制任务末尾调用)
+// ================================================================
+void PL_SaveAngles(void)
+{
+    float angles[4];
+    for (int i = 0; i < Motor_Num; i++) {
+        angles[i] = motor[i].CurrentAngle;
     }
 
-    // 读取最后一条有效记录
-    PL_Record_t rec;
-    memcpy(&rec, (void *)(PL_FLASH_ADDR + off), sizeof(PL_Record_t));
+    uint32_t base = pl_toggle ? PL_SLOT_B_BASE : PL_SLOT_A_BASE;
+    pl_write_slot(base, pl_seq, angles);
 
-    if (rec.magic == PL_MAGIC && pl_calc_crc(rec.angles) == rec.crc) {
-        memcpy(angles_out, rec.angles, 4 * sizeof(float));
-    }
-
-    // 使已恢复的记录失效 (清除 magic, ~30μs), 避免下次启动重复恢复
-    pl_invalidate_record(off);
-
-    // 下次 PVD 写入位置 = 最后记录之后
-    pl_write_offset = off + PL_RECORD_SIZE;
-    if (pl_write_offset >= PL_FLASH_SIZE) {
-        // 扇区写满时才擦除 (6553+ 次掉电才会触发, 极其罕见)
-        pl_erase_sector();
-    }
+    pl_seq++;
+    pl_toggle = !pl_toggle;
 }
 
 // ================================================================
@@ -136,52 +159,10 @@ void PL_EmergencyStop(void)
 }
 
 // ================================================================
-//  掉电保存 (PVD 回调中调用)
-// ================================================================
-static void pl_save_to_flash(void)
-{
-    if (pl_write_offset + PL_RECORD_SIZE > PL_FLASH_SIZE) {
-        return;  // 扇区写满 (极端情况), 放弃本次保存
-    }
-
-    PL_Record_t rec;
-    rec.magic = PL_MAGIC;
-    for (int i = 0; i < Motor_Num; i++) {
-        rec.angles[i] = motor[i].CurrentAngle;
-    }
-    rec.crc = pl_calc_crc(rec.angles);
-
-    uint32_t addr = PL_FLASH_ADDR + pl_write_offset;
-    uint32_t *p = (uint32_t *)&rec;
-    uint32_t word_count = (sizeof(PL_Record_t) + 3) / 4;
-
-    // 关中断防止高优先级 ISR 在 Flash 写入期间访问 Flash 导致总线冲突
-    __disable_irq();
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR |
-                           FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR |
-                           FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
-
-    HAL_FLASH_Unlock();
-    for (uint32_t i = 0; i < word_count; i++) {
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i * 4, p[i]);
-    }
-    HAL_FLASH_Lock();
-    __enable_irq();
-
-    pl_write_offset += PL_RECORD_SIZE;
-}
-
-// ================================================================
-//  掉电过程中不能等待, PVD 中断回调
+//  PVD 中断回调 (最小化: 仅刹停, 不写 Flash)
+//  真正的数据持久化由 10ms 任务的 PL_SaveAngles 完成
 // ================================================================
 void HAL_PWR_PVDCallback(void)
 {
-    PL_EmergencyStop();   // 先刹停所有电机
-    pl_save_to_flash();   // 写 Flash (关中断内, ~150μs)
+    PL_EmergencyStop();
 }
-
-// ================================================================
-//  上电自主回零
-//  在 main.c 调用 PL_Init 恢复角度后,
-//  设置 mode=1 和 Reg=0 即可让 PID 把电机带回零点
-// ================================================================

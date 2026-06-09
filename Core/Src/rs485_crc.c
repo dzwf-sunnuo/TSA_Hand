@@ -66,7 +66,7 @@ const uint8_t auchCRCLo[] = {
 输出:
 ******************************************************************/
 
-uint16_t Modbus_CRC16( uint8_t *puchMsg, uint16_t usDataLen )
+uint16_t Modbus_CRC16(  uint8_t *puchMsg, uint16_t usDataLen )
 {
     uint8_t uchCRCHi = 0xFF ; // 高CRC字节初始化
     uint8_t uchCRCLo = 0xFF ; // 低CRC 字节初始化

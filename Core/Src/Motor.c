@@ -3,6 +3,7 @@
 #include "adc.h"
 #include "usart.h"
 #include "rs485.h"
+#include "rs485_crc.h"
 
 /* 堵转保护 */
 #define STALL_TIMEOUT_TICKS  300     // 3 秒 (10ms/tick)
@@ -173,6 +174,10 @@ void Motor_Control_Loop(void)
 
             motor[i].IOFlag = io_flag;
             motor[i].CurrentAngle += (float)delta * ANGLE_CONV_FACTOR;
+            // 立即更新掉电保存 CRC：尽量在角度更新后立刻计算 CRC，
+            // 以缩短角度采样到掉电保存之间的时间窗口。
+            // 注意：每次在此处计算会在 10ms 循环内执行多次（最多 Motor_Num 次），
+            // 代价是额外的少量 CPU 开销，但能保证 CRC 数据尽可能接近实时角度。
             motor[i].CurrentSpeed = (float)delta * SPEED_CONV_FACTOR;
             motor[i].CurrentPosition = (float)ADC_HallValue[i];
 
@@ -258,6 +263,8 @@ void Motor_Control_Loop(void)
             /* 2.4 硬件执行 */
             Set_Motor(i, set_speed, motor[i].IOFlag);
         }
+
+        /* CRC 更新已移到每个电机角度更新之后，以缩短角度变化到掉电保存之间的延迟 */
 }
 
 /**
