@@ -51,9 +51,20 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == USART1)
     {
-        // 1. 记录接收长度并设置完成标志
-        modbus.recount = Size;
-        modbus.reflag = 1;
+        MODBUS_FrameTypeDef frame;
+
+        if (Size > MODBUS_BUF_SIZE)
+        {
+            Size = MODBUS_BUF_SIZE;
+        }
+
+        frame.length = Size;
+        memcpy(frame.data, modbus.rcbuf, Size);
+
+        if (modbusRxQueueHandle != NULL)
+        {
+            (void)osMessageQueuePut(modbusRxQueueHandle, &frame, 0U, 0U);
+        }
 
         // 2. 重新开启下一次接收 (DMA 模式设为 NORMAL 时需要重新开启)
         HAL_UARTEx_ReceiveToIdle_DMA(&huart1, modbus.rcbuf, MODBUS_BUF_SIZE);
@@ -101,50 +112,48 @@ void RS485_UART_IDLE_CallBack(void)
 /**
  * @brief Modbus 事件处理逻辑
  */
-void Modbus_Event()
+void Modbus_Event(const MODBUS_FrameTypeDef *frame)
 {
     uint16_t crc, rccrc;
-    
-    if (modbus.reflag == 0) return; 
-    
-    if (modbus.recount < 4) 
+
+    if (frame == NULL || frame->length < 4U)
     {
-        modbus.recount = 0;
-        modbus.reflag = 0;
         return;
     }
 
-    crc = Modbus_CRC16(modbus.rcbuf, modbus.recount - 2);
-    rccrc = modbus.rcbuf[modbus.recount - 2] * 256 + modbus.rcbuf[modbus.recount - 1];
+    crc = Modbus_CRC16(frame->data, frame->length - 2U);
+    rccrc = (uint16_t)(frame->data[frame->length - 2U] * 256U + frame->data[frame->length - 1U]);
     
     if (crc == rccrc)
     {
-        if (modbus.rcbuf[0] == modbus.myadd || modbus.rcbuf[0] == 0x00) 
+        if (frame->data[0] == modbus.myadd || frame->data[0] == 0x00) 
         {
-            switch (modbus.rcbuf[1])
+            switch (frame->data[1])
             {
-                case 3:  Modbus_Func3();  break;
-                case 6:  Modbus_Func6();  break;
-                case 16: Modbus_Func16(); break;
+                case 3:  Modbus_Func3(frame->data, frame->length);  break;
+                case 6:  Modbus_Func6(frame->data, frame->length);  break;
+                case 16: Modbus_Func16(frame->data, frame->length); break;
                 default: break;
             }
         }
     }
-    
-    modbus.recount = 0;
-    modbus.reflag = 0;
 }
 
 /**
  * @brief 03 功能码处理：读取寄存器
  */
-void Modbus_Func3()
+void Modbus_Func3(const uint8_t *buffer, uint16_t length)
 {
     uint16_t Regadd, Reglen, crc;
     uint16_t i, send_len = 0;
 
-    Regadd = modbus.rcbuf[2] * 256 + modbus.rcbuf[3];
-    Reglen = modbus.rcbuf[4] * 256 + modbus.rcbuf[5];
+    if (buffer == NULL || length < 8U)
+    {
+        return;
+    }
+
+    Regadd = (uint16_t)(buffer[2] * 256U + buffer[3]);
+    Reglen = (uint16_t)(buffer[4] * 256U + buffer[5]);
 
     if (Regadd + Reglen > 100) return;
 
@@ -170,13 +179,18 @@ void Modbus_Func3()
 /**
  * @brief 06 功能码处理：写单个寄存器
  */
-void Modbus_Func6()
+void Modbus_Func6(const uint8_t *buffer, uint16_t length)
 {
     uint16_t Regadd, val, crc;
     uint16_t send_len = 0;
 
-    Regadd = modbus.rcbuf[2] * 256 + modbus.rcbuf[3];
-    val = modbus.rcbuf[4] * 256 + modbus.rcbuf[5];
+    if (buffer == NULL || length < 8U)
+    {
+        return;
+    }
+
+    Regadd = (uint16_t)(buffer[2] * 256U + buffer[3]);
+    val = (uint16_t)(buffer[4] * 256U + buffer[5]);
 
     if (Regadd >= 100) return;
 
@@ -201,19 +215,24 @@ void Modbus_Func6()
 /**
  * @brief 16 功能码处理：写多个寄存器
  */
-void Modbus_Func16()
+void Modbus_Func16(const uint8_t *buffer, uint16_t length)
 {
     uint16_t Regadd, Reglen, crc;
     uint16_t i, send_len = 0;
 
-    Regadd = modbus.rcbuf[2] * 256 + modbus.rcbuf[3];
-    Reglen = modbus.rcbuf[4] * 256 + modbus.rcbuf[5];
+    if (buffer == NULL || length < 9U)
+    {
+        return;
+    }
+
+    Regadd = (uint16_t)(buffer[2] * 256U + buffer[3]);
+    Reglen = (uint16_t)(buffer[4] * 256U + buffer[5]);
 
     if (Regadd + Reglen > 100) return;
 
     for (i = 0; i < Reglen; i++)
     {
-        Reg[Regadd + i] = modbus.rcbuf[7 + i * 2] * 256 + modbus.rcbuf[8 + i * 2];
+        Reg[Regadd + i] = (uint16_t)(buffer[7 + i * 2] * 256U + buffer[8 + i * 2]);
     }
 
     modbus.sendbuf[send_len++] = modbus.myadd;

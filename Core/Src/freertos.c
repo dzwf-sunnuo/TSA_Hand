@@ -30,6 +30,7 @@
 #include "adc.h"
 #include "power_loss.h"
 #include "stdio.h"
+#include <string.h>
 #include <stdint.h>
 /* USER CODE END Includes */
 
@@ -58,6 +59,7 @@ const osMutexAttr_t xMotorDataMutex_attributes = {
   .name = "xMotorDataMutex"
 };
 osSemaphoreId_t Sem_ADC_Done;  // DMA 单次采集完成信号
+osMessageQueueId_t modbusRxQueueHandle;
 osTimerId_t powerLossInitTimerHandle;
 const osTimerAttr_t powerLossInitTimer_attributes = {
   .name = "powerLossInitTimer"
@@ -135,7 +137,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  modbusRxQueueHandle = osMessageQueueNew(MODBUS_RX_QUEUE_LENGTH, sizeof(MODBUS_FrameTypeDef), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -216,19 +218,29 @@ void vMotorControlTask(void *argument)
   * @brief Modbus 通信解析任务 (高优先级)
   * @param argument: 未使用
   * @retval None
-  * @note 周期性检查空闲中断标记并解析Modbus数据
+  * @note 等待串口接收中断通过消息队列传递来的 Modbus 帧，解析后更新寄存器或执行相应操作
   */
 void vModbusCommTask(void *argument)
 {
+  MODBUS_FrameTypeDef frame;
+
   for(;;)
   {
-    // 降低检查频率，并先检查标志位再申请锁，极大地减小对控制任务的干扰
-    osDelay(10);
-    
-    if (modbus.reflag != 0) { // 仅在 DMA+IDLE 收到一帧完整数据后才处理
+    if (modbusRxQueueHandle == NULL)
+    {
+      osDelay(1);
+      continue;// 如果消息队列未创建成功，等待后重试
+    }
+
+    if (osMessageQueueGet(modbusRxQueueHandle, &frame, NULL, osWaitForever) == osOK) {
+      if (frame.length > MODBUS_BUF_SIZE)
+      {
+        continue;// 如果接收到的帧长度超过缓冲区大小，丢弃该帧
+      }
+
       if (xMotorDataMutexHandle != NULL) {
         if (osMutexAcquire(xMotorDataMutexHandle, 10) == osOK) { // 尝试拿锁，超时 10ms
-          Modbus_Event(); 
+          Modbus_Event(&frame); 
           osMutexRelease(xMotorDataMutexHandle);
         }
       }

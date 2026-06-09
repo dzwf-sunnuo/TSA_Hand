@@ -115,7 +115,6 @@ int main(void)
   /* USER CODE BEGIN 2 */
   printf("(FreeRTOS Version)\r\n");
   Modbus_Send_Byte('a'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
-  Modbus_Init();  // MODBUS协议初始化（DMA+IDLE）
   Motor_Init();   // 电机初始化及 PID 参数设置
 
   // ADC DMA 由 vSensorProcessTask 按需启动, 不再在初始化时持续运行
@@ -125,6 +124,7 @@ int main(void)
   /* Init scheduler */
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
+  Modbus_Init();  // MODBUS协议初始化（DMA+IDLE），必须在消息队列创建之后执行
 
   /* Start scheduler */
   osKernelStart();
