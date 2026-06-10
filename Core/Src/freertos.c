@@ -52,7 +52,7 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 uint16_t ADC_NativeValue[80] = {0}; // DMA 目标缓冲区 (单次模式)
-uint16_t ADC_Snapshot[80] = {0};    // 完成回调中拷贝的快照
+__CCM_RAM_DATA uint16_t ADC_Snapshot[80] = {0};    // 完成回调中拷贝的快照
 
 osMutexId_t xMotorDataMutexHandle;
 const osMutexAttr_t xMotorDataMutex_attributes = {
@@ -60,15 +60,27 @@ const osMutexAttr_t xMotorDataMutex_attributes = {
 };
 osSemaphoreId_t Sem_ADC_Done;  // DMA 单次采集完成信号
 osMessageQueueId_t modbusRxQueueHandle;
-osTimerId_t powerLossInitTimerHandle;
-const osTimerAttr_t powerLossInitTimer_attributes = {
-  .name = "powerLossInitTimer"
+// UART 发送完成信号量（用于替换 busy-wait）
+osSemaphoreId_t uartTxSemHandle;
+
+// 1s 周期 Modbus 定时器（替代原先的累加计时方式）
+osTimerId_t modbus1sTimerHandle;
+const osTimerAttr_t modbus1sTimer_attributes = {
+  .name = "modbus1sTimer"
 };
 
+// 注：暂时停用掉电延迟初始化定时器
+// osTimerId_t powerLossInitTimerHandle;
+// const osTimerAttr_t powerLossInitTimer_attributes = {
+//   .name = "powerLossInitTimer"
+// };
+
 osThreadId_t motorControlTaskHandle;
+// 电机控制任务使用静态分配: TCB + 栈全部放入 CCMRAM (零等待)
+__CCM_RAM_DATA static StaticTask_t motorControlTask_TCB;
+__CCM_RAM_DATA static StackType_t motorControlTask_Stack[512];  // 512 words = 2KB
 const osThreadAttr_t motorControlTask_attributes = {
   .name = "motorControlTask",
-  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityRealtime,
 };
 
@@ -108,6 +120,7 @@ void vModbusCommTask(void *argument);
 void vSensorProcessTask(void *argument);
 void vSystemMonitorTask(void *argument);
 void PowerLossInitTimerCallback(void *argument);
+void Modbus1sTimerCallback(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -130,10 +143,12 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   Sem_ADC_Done = osSemaphoreNew(1, 0, NULL);  // DMA 单次完成
+  uartTxSemHandle = osSemaphoreNew(1, 0, NULL); // UART TX 完成信号量（初始为 0）
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  powerLossInitTimerHandle = osTimerNew(PowerLossInitTimerCallback, osTimerOnce, NULL, &powerLossInitTimer_attributes);
+  // 使用 1s 定时器触发 Modbus 定时事件
+  modbus1sTimerHandle = osTimerNew(Modbus1sTimerCallback, osTimerPeriodic, NULL, &modbus1sTimer_attributes);
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -145,7 +160,10 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  motorControlTaskHandle  = osThreadNew(vMotorControlTask, NULL, &motorControlTask_attributes);
+  // 静态创建电机控制任务: TCB + 栈全在 CCMRAM, 无堆分配碎片风险
+  motorControlTaskHandle  = (osThreadId_t)xTaskCreateStatic(
+      vMotorControlTask, "motorControl", 512, NULL,
+      osPriorityRealtime, motorControlTask_Stack, &motorControlTask_TCB);
   modbusCommTaskHandle    = osThreadNew(vModbusCommTask, NULL, &modbusCommTask_attributes);
   sensorProcessTaskHandle = osThreadNew(vSensorProcessTask, NULL, &sensorProcessTask_attributes);
   systemMonitorTaskHandle = osThreadNew(vSystemMonitorTask, NULL, &systemMonitorTask_attributes);
@@ -167,8 +185,10 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  if (powerLossInitTimerHandle != NULL) {
-    osTimerStart(powerLossInitTimerHandle, 1000U);
+  // 不启用掉电延迟初始化定时器（功能已停用）
+  (void)argument;
+  if (modbus1sTimerHandle != NULL) {
+    osTimerStart(modbus1sTimerHandle, 1000U);
   }
   vTaskDelete(NULL); // 删除默认任务，没这个默认任务cubeMX报错
   /* Infinite loop */
@@ -187,14 +207,14 @@ void StartDefaultTask(void *argument)
   * @retval None
   * @note 绝对的 10ms 周期执行闭环 PID 计算
   */
-void vMotorControlTask(void *argument)
+__CCM_RAM_TEXT void vMotorControlTask(void *argument)
 {
   uint32_t PreviousWakeTime = osKernelGetTickCount();
  // uint32_t i = 0,j = 0; 
   for(;;)
   {
-    // 绝对延时 10ms 周期，确保控制环路稳定
-    osDelayUntil(PreviousWakeTime + 10); 
+    // 绝对延时周期 (由 CONTROL_FREQ_HZ 决定), 确保控制环路稳定
+    osDelayUntil(PreviousWakeTime + CONTROL_PERIOD_TICKS);
     PreviousWakeTime = osKernelGetTickCount();
 
     // 获取互斥锁，保护串口指令与本地闭环计算的数据安全
@@ -202,7 +222,8 @@ void vMotorControlTask(void *argument)
      // i = osKernelGetTickCount();
       osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
       Motor_Control_Loop(); // 执行电机位置/速度内环闭环计算并输出PWM
-      PL_SaveAngles();        // 将当前角度写入备份寄存器 (双槽交替, ~30μs)
+      // 掉电保存相关功能已停用，如需恢复请取消注释并启用 timer
+      // PL_SaveAngles();        // 将当前角度写入备份寄存器 (双槽交替, ~30μs)
       osMutexRelease(xMotorDataMutexHandle);
      /* i = osKernelGetTickCount() - i;
       j++;
@@ -375,33 +396,27 @@ void vSystemMonitorTask(void *argument)
   }
 }
 
+/**
+ * @brief 1s 定时器回调：设置 Modbus 周期性标志（事件驱动替代计时累加）
+ */
+void Modbus1sTimerCallback(void *argument)
+{
+  (void)argument;
+  // 通过定时器触发 Modbus 周期事件，保留简单标志兼容现有逻辑
+  modbus.Host_time_flag = 1;
+}
+
 
   /**
     * @brief 掉电恢复延迟初始化定时器回调
     * @param argument: 未使用
     * @retval None
     */
+  /* 掉电恢复功能已停用：保留空回调以防外部引用 */
   void PowerLossInitTimerCallback(void *argument)
   {
-    float saved_angles[Motor_Num] = {0.0f};
-
     (void)argument;
-
-    PL_Init(saved_angles);
-
-    if (xMotorDataMutexHandle != NULL) {
-      if (osMutexAcquire(xMotorDataMutexHandle, 100) == osOK) {
-        for (int i = 0; i < Motor_Num; i++) {
-          motor[i].CurrentAngle = saved_angles[i];
-          motor[i].TargetAngle = 0.0f;
-          motor[i].TargetSpeed = 0.0f;
-          Reg[i] = 0x0064;
-        }
-        //Modbus_Send_Byte('c'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
-        Reg[4] = 0x0101;
-        osMutexRelease(xMotorDataMutexHandle);
-      }
-    }
+    // 功能被禁用 -- 原实现已注释
   }
 
 /* USER CODE END Application */

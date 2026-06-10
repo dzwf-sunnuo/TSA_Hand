@@ -46,7 +46,11 @@ extern "C" {
 
 /* Exported macro ------------------------------------------------------------*/
 /* USER CODE BEGIN EM */
-
+// 声明函数放在 CCMRAM (内核耦合内存 64KB @0x10000000, 零等待)
+// 数据用 .ccmram, 代码用 .ccmram.text, 避免 section type conflict
+// 启动代码会将代码从 Flash 自动复制到 CCMRAM
+#define __CCM_RAM_TEXT __attribute__((section(".ccmram.text")))   // 函数
+#define __CCM_RAM_DATA __attribute__((section(".ccmram")))        // 变量
 /* USER CODE END EM */
 
 /* Exported functions prototypes ---------------------------------------------*/

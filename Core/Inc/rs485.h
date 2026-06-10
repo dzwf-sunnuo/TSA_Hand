@@ -42,6 +42,7 @@ typedef struct
 extern MODBUS modbus;
 extern uint16_t Reg[100];
 extern osMessageQueueId_t modbusRxQueueHandle;
+extern osSemaphoreId_t uartTxSemHandle; // UART 发送完成信号量
 
 
 void Modbus_Send_Byte(uint8_t ch);

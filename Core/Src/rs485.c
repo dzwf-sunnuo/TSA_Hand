@@ -2,9 +2,10 @@
 #include "usart.h"
 #include <stdio.h>
 #include <string.h>
+#include "cmsis_os.h"
 
 MODBUS modbus;
-uint16_t Reg[100] = {0};
+uint16_t Reg[100] __attribute__((section(".ccmram"))) = {0};
 
 //static uint8_t modbus_rx_byte; // 全局静态变量用于中断接收中转
 
@@ -13,7 +14,12 @@ uint16_t Reg[100] = {0};
  */
 void Modbus_Send_Byte(uint8_t ch)
 {
-    HAL_UART_Transmit(&huart1, &ch, 1, 10);
+    // 非阻塞发送，等待发送完成信号量替代 busy-wait
+    if (HAL_UART_Transmit_IT(&huart1, &ch, 1) == HAL_OK) {
+        if (uartTxSemHandle != NULL) {
+            (void)osSemaphoreAcquire(uartTxSemHandle, 100); // 最长等待 100ms
+        }
+    }
 }
 
 /**
@@ -99,6 +105,18 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 }
 
 /**
+ * @brief UART 发送完成回调（由 HAL 调用）
+ */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        if (uartTxSemHandle != NULL) {
+            (void)osSemaphoreRelease(uartTxSemHandle);
+        }
+    }
+}
+
+/**
  * @brief 串口空闲中断回调处理函数 (旧回调，由 stm32f4xx_it.c 调用)
  * @note  在使用 HAL_UARTEx_ReceiveToIdle_DMA 时，HAL 内部已处理 IDLE 标志，
  *        此函数现在变为可选。
@@ -171,9 +189,11 @@ void Modbus_Func3(const uint8_t *buffer, uint16_t length)
     modbus.sendbuf[send_len++] = crc >> 8;
     modbus.sendbuf[send_len++] = crc & 0xFF;
 
-    HAL_UART_Transmit(&huart1, modbus.sendbuf, send_len, 100);
-    uint32_t timeout = 0xFFFF;
-    while(__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET && timeout--);
+    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, send_len) == HAL_OK) {
+        if (uartTxSemHandle != NULL) {
+            (void)osSemaphoreAcquire(uartTxSemHandle, 100); // 等待完成
+        }
+    }
 }
 
 /**
@@ -207,9 +227,11 @@ void Modbus_Func6(const uint8_t *buffer, uint16_t length)
     modbus.sendbuf[send_len++] = crc >> 8;
     modbus.sendbuf[send_len++] = crc & 0xFF;
 
-    HAL_UART_Transmit(&huart1, modbus.sendbuf, send_len, 100);
-    uint32_t timeout = 0xFFFF;
-    while(__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET && timeout--);
+    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, send_len) == HAL_OK) {
+        if (uartTxSemHandle != NULL) {
+            (void)osSemaphoreAcquire(uartTxSemHandle, 100);
+        }
+    }
 }
 
 /**
@@ -246,7 +268,9 @@ void Modbus_Func16(const uint8_t *buffer, uint16_t length)
     modbus.sendbuf[send_len++] = crc >> 8;
     modbus.sendbuf[send_len++] = crc & 0xFF;
 
-    HAL_UART_Transmit(&huart1, modbus.sendbuf, send_len, 100);
-    uint32_t timeout = 0xFFFF;
-    while(__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET && timeout--);
+    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, send_len) == HAL_OK) {
+        if (uartTxSemHandle != NULL) {
+            (void)osSemaphoreAcquire(uartTxSemHandle, 100);
+        }
+    }
 }

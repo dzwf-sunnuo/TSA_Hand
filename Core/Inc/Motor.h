@@ -11,6 +11,10 @@
 #define Hall_Num 4              // 关节霍尔传感器数量
 #define CalibrationLEN 2        // 传感器标定点数量 (用于线性插值)
 
+// 电机控制频率 (Hz), 所有相关宏和延时统一由此派生
+#define CONTROL_FREQ_HZ         100     // 100Hz = 10ms 控制周期
+#define CONTROL_PERIOD_TICKS    (1000 / CONTROL_FREQ_HZ)  // FreeRTOS tick 数 (tick=1kHz)
+
 /* 电机物理特性常量 */
 #define Real_OneTurn 365.0f     // 减速后输出轴转动一圈对应的编码器计数值(已换算为角度)
 #define Real_MaxSpeed 50.0f      // 电机运行允许的最大速度？

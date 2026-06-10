@@ -6,7 +6,8 @@
 #include "rs485_crc.h"
 
 /* 堵转保护 */
-#define STALL_TIMEOUT_TICKS  300     // 3 秒 (10ms/tick)
+#define STALL_TIMEOUT_SECONDS 3.0f   // 堵转判定时间 (秒)
+#define STALL_TIMEOUT_TICKS   ((uint16_t)(STALL_TIMEOUT_SECONDS * CONTROL_FREQ_HZ))
 #define STALL_ANGLE_THRESHOLD  (Real_OneTurn * 1.02f)  // 1 圈 = ~7.3 编码器计数
 
 /**
@@ -37,47 +38,51 @@ const Motor_HW_Config motor_hw_map[Motor_Num] = {
 
 
 /* 全局变量定义 */
-Motor_Struct motor[Motor_Num];          // 电机状态结构体数组
-PID_Increment_Struct PID_Speed[Motor_Num];    // 速度环 PID 状态
-PID_Increment_Struct PID_Position[Motor_Num]; // 关节位置环 PID 状态
-PID_Increment_Struct PID_Angle[Motor_Num];    // 出轴角度环 PID 状态
+Motor_Struct motor[Motor_Num] __CCM_RAM_DATA = {0};          // 电机状态结构体数组
+PID_Increment_Struct PID_Speed[Motor_Num] __CCM_RAM_DATA = {0};    // 速度环 PID 状态
+PID_Increment_Struct PID_Position[Motor_Num] __CCM_RAM_DATA = {0}; // 关节位置环 PID 状态
+PID_Increment_Struct PID_Angle[Motor_Num] __CCM_RAM_DATA = {0};    // 出轴角度环 PID 状态
 
-uint16_t ADC_HallValue[Hall_Num] = {0}; // 经过滤波后的 ADC 原始值
+uint16_t ADC_HallValue[Hall_Num] __CCM_RAM_DATA = {0}; // 经过滤波后的 ADC 原始值
 
 /**
  * @brief 计算常数预推导，老电机要全部*20
- * 
- * SPEED_CONV_FACTOR: 
- *   公式: (100Hz * 60s * 修正系数1.15) / (减速比4 * 编码器线数1024 * 4倍频)
+ *
+ * 所有公式统一从 CONTROL_FREQ_HZ 派生, 修改频率只需改 Motor.h 一个地方
+ *
+ * SPEED_CONV_FACTOR:
+ *   公式: (控制频率Hz * 60s * 修正系数1.15) / (减速比4 * 编码器线数1024 * 4倍频)
+ *   例:   100Hz → (100*60*1.15)/16384 ≈ 0.42 rpm/pulse
  * ANGLE_CONV_FACTOR:
  *   公式: (360度 * 修正系数1.15) / (减速比4 * 编码器线数1024 * 4倍频)
+ *   与频率无关，保持不变
  */
-#define SPEED_CONV_FACTOR (100.0f * 60.0f * 1.15f / (4.0f * 1024.0f * 4.0f))
+#define SPEED_CONV_FACTOR ((float)(CONTROL_FREQ_HZ) * 60.0f * 1.15f / (4.0f * 1024.0f * 4.0f))
 #define ANGLE_CONV_FACTOR (360.0f * 1.15f / (4.0f * 1024.0f * 4.0f))
 
 /* 标定数据集：用于 lineInterp 函数将角度映射为 ADC 目标值 */
-static float JointAngle[4][CalibrationLEN] = {{0.0f, 90.0f}, {0.0f, 90.0f}, {0.0f, 90.0f}, {0.0f, 90.0f}};
-static float ADValue[4][CalibrationLEN] = {
+__CCM_RAM_DATA static float JointAngle[4][CalibrationLEN] = {{0.0f, 90.0f}, {0.0f, 90.0f}, {0.0f, 90.0f}, {0.0f, 90.0f}} ;
+__CCM_RAM_DATA static float ADValue[4][CalibrationLEN] = {
     {1560.0f, 2580.0f}, // 关节 1
     {2475.0f, 1435.0f}, // 关节 2
     {2500.0f, 1450.0f}, // 关节 3
     {2565.0f, 1540.0f}  // 关节 4
-};
+} ;
 
-static int InterpolationFlag[4] = {11, 11, 11, 11}; // 插值搜索方向标志
+__CCM_RAM_DATA static int InterpolationFlag[4] = {11, 11, 11, 11} ; // 插值搜索方向标志
 
 /* PID 初始参数 */
-float Kp_Position[Hall_Num] = {5.0f, 8.0f, 8.0f, 8.0f};
-float Ki_Position[Hall_Num] = {0.0f, 0.0f, 0.0f, 0.0f};
-float Kd_Position[Hall_Num] = {0.0f, 0.0f, 0.0f, 0.0f};
+__CCM_RAM_DATA float Kp_Position[Hall_Num]  = {5.0f, 8.0f, 8.0f, 8.0f} ;
+__CCM_RAM_DATA float Ki_Position[Hall_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
+__CCM_RAM_DATA float Kd_Position[Hall_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
 
-float Kp_Angle[Motor_Num] = {0.5f, 0.7f, 0.7f, 0.7f};
-float Ki_Angle[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f};
-float Kd_Angle[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f};
+__CCM_RAM_DATA float Kp_Angle[Motor_Num] = {0.5f, 0.7f, 0.7f, 0.7f} ;
+__CCM_RAM_DATA float Ki_Angle[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
+__CCM_RAM_DATA float Kd_Angle[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
 
-float Kp_Speed[Motor_Num] = {0.3f, 0.3f, 0.3f, 0.3f};
-float Ki_Speed[Motor_Num] = {0.1f, 0.1f, 0.1f, 0.1f};
-float Kd_Speed[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f};
+__CCM_RAM_DATA float Kp_Speed[Motor_Num] = {0.3f, 0.3f, 0.3f, 0.3f} ;
+__CCM_RAM_DATA float Ki_Speed[Motor_Num] = {0.1f, 0.1f, 0.1f, 0.1f} ;
+__CCM_RAM_DATA float Kd_Speed[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
 
 /**
  * @brief 电机控制系统初始化
@@ -157,7 +162,7 @@ void Modbus_Timer_Loop(void)
     }
 }
 
-void Motor_Control_Loop(void)
+__CCM_RAM_TEXT void Motor_Control_Loop(void)
 {
     /* [2] 10ms 电机控制闭环逻辑 */
         uint8_t mode = Reg[4] >> 8;     // 从 Modbus 寄存器 Reg[4] 高 8 位获取运动模式
@@ -276,7 +281,7 @@ void Motor_Control_Loop(void)
  * @param set_speed 控制增量值 (-1000 到 1000)。
  * @param flag 启停标志 (0: 停止, 非0: 运行)。
  */
-void Set_Motor(uint8_t i, int16_t set_speed, uint8_t flag)
+__CCM_RAM_TEXT void Set_Motor(uint8_t i, int16_t set_speed, uint8_t flag)
 {
     if (i >= Motor_Num) return;
     if (flag == 0) set_speed = 0; // 若 flag 为 0，则强制停止输出
@@ -361,7 +366,7 @@ float lineInterp(float xa[], float ya[], int length, float data, int flag)
  * @param Target 目标设定值。
  * @return float PID 控制器的输出增量。
  */
-float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
+__CCM_RAM_TEXT float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
 {
     float err = Target - Current;
     float proportion = err - PID->Error_Last1;
