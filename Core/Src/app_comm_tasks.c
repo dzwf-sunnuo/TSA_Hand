@@ -9,7 +9,7 @@
 #include "MyCan.h"
 
 /* CAN 通信常量 */
-#define CAN_HAND_ID             0x021   // 手部控制 CAN ID: 0x020=右手, 0x021=左手 (二选一)
+#define CAN_HAND_ID             0x020   // 手部控制 CAN ID: 0x020=右手, 0x021=左手 (二选一)
 #define CAN_HEARTBEAT_REQUEST   0x00    // data[0]=0x00: 心跳请求
 #define CAN_HEARTBEAT_RESPONSE  0x01    // data[0]=0x01: 心跳应答
 
@@ -29,7 +29,7 @@ osSemaphoreId_t Sem_NewSlaveCmd;
 osSemaphoreId_t Sem_IR_Ready;
 osSemaphoreId_t Sem_NewMotionCmd;      // finger_motion 打断信号
 osMessageQueueId_t Queue_CAN_Rx;
-osMessageQueueId_t Queue_WristCmd;   // 手腕命令队列 (方案 A)
+osMessageQueueId_t Queue_WristCmd;   // 手腕命令
 
 /* ================== 系统全局状态 ================== */
 volatile uint8_t  sys_infrared_enable = 1;       // 红外遥控使能
@@ -78,19 +78,31 @@ void Action_Dispatch(const ActionCmd_t *cmd)
 
     /* —— 手指连续动作 —— */
     case ACTION_FINGER_COUNT:
-        // TODO: finger_motion(COUNT_NUMBERS, cmd->param2);
+        for (uint16_t r = 0; r < cmd->param1; r++) {
+            finger_motion(COUNT_NUMBERS, cmd->param2);
+            if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
+        }
         break;
 
     case ACTION_FINGER_BEND:
-        // TODO: finger_motion(CONTINUOUS_BENDING, cmd->param2);
+        for (uint16_t r = 0; r < cmd->param1; r++) {
+            finger_motion(CONTINUOUS_BENDING, cmd->param2);
+            if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
+        }
         break;
 
     case ACTION_FINGER_GESTURE:
-        // TODO: finger_motion(OTHER_MOTION, cmd->param2);
+        for (uint16_t r = 0; r < cmd->param1; r++) {
+            finger_motion(OTHER_MOTION, cmd->param2);
+            if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
+        }
         break;
 
     case ACTION_FINGER_FIST:
-        // TODO: finger_motion(CONTINUOUS_FISTING, cmd->param2);
+        for (uint16_t r = 0; r < cmd->param1; r++) {
+            finger_motion(CONTINUOUS_FISTING, cmd->param2);
+            if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
+        }
         break;
 
     /* —— 手指单个动作 —— */
@@ -223,14 +235,17 @@ void IR_Key_MapToAction(uint16_t key_code, ActionCmd_t *cmd)
  *     子命令: 0x0000=停, 0x0001=连续旋转,
  *       0x0002-0x0004=预设位置, 0x0005=设置周期
  *
- *   data[0] = 0x12 → 手指连续动作
- *     子命令: 0x0000=停止, 0x0001=连续弯折, 0x0002=数数字, 0x0003=握拳
- *     data[3] = 循环次数
+ *   data[0] = 0x12 → 手指连续动作 (固定速度)
+ *     子命令 (data[1..2]): 0x0000=停, 0x0001=弯折, 0x0002=数数字, 0x0003=握拳
+ *     data[3] = 循环次数 (8-bit)
  *
  *   data[0] = 0x13 → 手指单个动作
  *     子命令 (data[1..2]) = 手势编号
  *
- *   data[0] = 0x14 → 手指单个动作 (data[1..2]=16位手势编号, 大端)
+ *   data[0] = 0x14 → 手指连续动作 (自定义速度)
+ *     子命令 (data[1..2]): 0x0001=数数字, 0x0002=弯折, 0x0003=其他, 0x0004=握拳
+ *     data[3..4] = 速度 ms (uint16 大端)
+ *     data[5..6] = 循环次数 (uint16 大端)
  *
  *   以下为直接硬件指令，在 Task_CAN_Process_Entry 中处理，不经过本函数:
  *   data[0] = 0x15 → 全电机正转 (data[1..7]=关节01-07圈数)
@@ -278,23 +293,30 @@ void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
         }
         break;
 
-    case 0x12:   // 手指连续动作 (data[1..2]=16位子命令, 大端)
-        switch (subcmd) {/*
+    case 0x12:   // 手指连续动作 (data[1..2]=类型, data[3]=次数, 固定速度)
+        cmd->param1 = msg->data[3];  // 重复次数 (8-bit)
+        switch (subcmd) {
         case 0x0000: cmd->action = ACTION_ALL_STOP;                            break;
-        case 0x0001: cmd->action = ACTION_FINGER_BEND;  cmd->param1 = msg->data[3]; cmd->param2 = 300;  break;
-        case 0x0002: cmd->action = ACTION_FINGER_COUNT; cmd->param1 = msg->data[3]; cmd->param2 = 1300; break;
-        case 0x0003: cmd->action = ACTION_FINGER_FIST;  cmd->param1 = msg->data[3]; cmd->param2 = 1500; break;*/
+        case 0x0001: cmd->action = ACTION_FINGER_BEND;  cmd->param2 = 300;  break;
+        case 0x0002: cmd->action = ACTION_FINGER_COUNT; cmd->param2 = 1300; break;
+        case 0x0003: cmd->action = ACTION_FINGER_FIST;  cmd->param2 = 1500; break;
         }
         break;
 
-    case 0x13:   // 手指单个动作 (data[1..2]=16位手势编号, 小端)
+    case 0x13:   // 手指单个动作 (data[1..2]=16位手势编号, 大端)
         cmd->action = ACTION_FINGER_SINGLE;
         cmd->param1 = subcmd;
         break;
 
-    case 0x14:   // 手指单个动作 (data[1..2]=16位手势编号, 大端)
-        cmd->action = ACTION_FINGER_SINGLE;
-        cmd->param1 = subcmd;
+    case 0x14:   // 手指连续动作 (data[1..2]=类型, data[3..4]=速度ms, data[5..6]=次数)
+        cmd->param1 = ((uint16_t)msg->data[5] << 8) | msg->data[6];  // 重复次数
+        cmd->param2 = ((uint16_t)msg->data[3] << 8) | msg->data[4];  // 速度 (ms)
+        switch (subcmd) {
+        case 0x0001: cmd->action = ACTION_FINGER_COUNT;   break;
+        case 0x0002: cmd->action = ACTION_FINGER_BEND;    break;
+        case 0x0003: cmd->action = ACTION_FINGER_GESTURE; break;
+        case 0x0004: cmd->action = ACTION_FINGER_FIST;    break;
+        }
         break;
 
     }
@@ -311,7 +333,7 @@ static void Can_AllMotors(const App_CAN_Msg_t *msg)
     Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
     Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
     Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
-    Reg[7] = 0x0000;
+    Reg[7] = ((uint16_t)msg->data[7] << 8) | 0x64;
     Reg[8] = 0x0101;
     Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
     osDelay(15);
@@ -329,7 +351,7 @@ static void Can_AllMotorsRev(const App_CAN_Msg_t *msg)
     Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
     Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
     Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
-    Reg[7] = 0x0000;
+    Reg[7] = ((uint16_t)msg->data[7] << 8) | 0x64;
     Reg[8] = 0x0301;
     Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
     osDelay(15);
@@ -440,6 +462,18 @@ void Task_DebugPrint_Entry(void *argument)
     }
 }
 
+void Task_Demo_Entry(void *argument){
+    osDelay(1000); // 等待系统稳定
+    vTaskDelete(NULL); 
+    for (;;)
+    {
+        finger_wrist_show(); // 展示用的预设动作序列
+        osDelay(5000);
+        osDelay(5000);
+        osDelay(3000);
+
+    }
+}
 /* ================================================================
  *  初始化
  * ================================================================ */
@@ -474,6 +508,10 @@ void App_Comm_Init(void)
 
     const osThreadAttr_t debug_attr = { .name = "DebugPrint", .stack_size = 512 * 4, .priority = osPriorityBelowNormal };
     osThreadNew(Task_DebugPrint_Entry, NULL, &debug_attr);
+
+    //针对展示的灵巧手创建一个从上电就自动开始的任务，用于展示
+    const osThreadAttr_t demo_attr = { .name = "DemoTask", .stack_size = 512 * 4, .priority = osPriorityAboveNormal };
+    osThreadNew(Task_Demo_Entry, NULL, &demo_attr);
 
     /* 4. 启动硬件 */
     HAL_UARTEx_ReceiveToIdle_DMA(&huart2, modbus2.rcbuf, sizeof(modbus2.rcbuf));

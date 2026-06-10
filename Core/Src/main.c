@@ -28,9 +28,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "app_comm_tasks.h" // 包含通信任务的头文件
-#include "rs485.h"        // 请取消注释以链接实际的硬件代码
-#include "Infrared1838.h" // 请取消注释以链接实际的硬件
+#include "app_comm_tasks.h" // 包含任务的头文件
+#include "rs485.h"        
+#include "Infrared1838.h" 
 #include "wrist.h"
 /* USER CODE END Includes */
 

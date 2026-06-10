@@ -17,8 +17,7 @@ enum Motion{COUNT_NUMBERS			 = 1,
 
 void finger_motion(uint8_t num, uint16_t speed);
 void finger_single_action(uint16_t num);
-
-
+void finger_wrist_show(void);
 
 
 #endif
