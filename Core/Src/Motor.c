@@ -43,7 +43,7 @@ PID_Increment_Struct PID_Speed[Motor_Num] __CCM_RAM_DATA = {0};    // 速度环 
 PID_Increment_Struct PID_Position[Motor_Num] __CCM_RAM_DATA = {0}; // 关节位置环 PID 状态
 PID_Increment_Struct PID_Angle[Motor_Num] __CCM_RAM_DATA = {0};    // 出轴角度环 PID 状态
 
-uint16_t ADC_HallValue[Hall_Num] __CCM_RAM_DATA = {0}; // 经过滤波后的 ADC 原始值
+uint16_t ADC_HallValue[Hall_Num] = {0}; // 经过滤波后的 ADC 原始值
 
 /**
  * @brief 计算常数预推导，老电机要全部*20
@@ -63,7 +63,7 @@ uint16_t ADC_HallValue[Hall_Num] __CCM_RAM_DATA = {0}; // 经过滤波后的 ADC
 /* 标定数据集：用于 lineInterp 函数将角度映射为 ADC 目标值 */
 __CCM_RAM_DATA static float JointAngle[4][CalibrationLEN] = {{0.0f, 90.0f}, {0.0f, 90.0f}, {0.0f, 90.0f}, {0.0f, 90.0f}} ;
 __CCM_RAM_DATA static float ADValue[4][CalibrationLEN] = {
-    {1560.0f, 2580.0f}, // 关节 1
+    {1530.0f, 2550.0f}, // 关节 1
     {2475.0f, 1435.0f}, // 关节 2
     {2500.0f, 1450.0f}, // 关节 3
     {2565.0f, 1540.0f}  // 关节 4
@@ -72,9 +72,9 @@ __CCM_RAM_DATA static float ADValue[4][CalibrationLEN] = {
 __CCM_RAM_DATA static int InterpolationFlag[4] = {11, 11, 11, 11} ; // 插值搜索方向标志
 
 /* PID 初始参数 */
-__CCM_RAM_DATA float Kp_Position[Hall_Num]  = {5.0f, 8.0f, 8.0f, 8.0f} ;
-__CCM_RAM_DATA float Ki_Position[Hall_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
-__CCM_RAM_DATA float Kd_Position[Hall_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
+__CCM_RAM_DATA float Kp_Position[Hall_Num]  = {0.5f, 0.5f, 0.5f, 0.5f} ;
+__CCM_RAM_DATA float Ki_Position[Hall_Num] = {0.00f, 0.03f, 0.03f, 0.03f} ;  // 小积分消除静差, 克服摩擦力
+__CCM_RAM_DATA float Kd_Position[Hall_Num] = {0.01f, 0.0f, 0.0f, 0.0f} ;
 
 __CCM_RAM_DATA float Kp_Angle[Motor_Num] = {0.5f, 0.7f, 0.7f, 0.7f} ;
 __CCM_RAM_DATA float Ki_Angle[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
@@ -139,6 +139,17 @@ void Motor_Init(void)
         PID_Position[i].OutMin = -12750.0f;
         PID_Position[i].OutMax =  12750.0f;
     }
+
+    // 将默认 PID 参数回写到 Reg[], 保证上位机 Modbus 读到的值正确
+    Reg[PID_REG_KP_POS] = (uint16_t)(Kp_Position[0] * 100.0f);
+    Reg[PID_REG_KI_POS] = (uint16_t)(Ki_Position[0] * 100.0f);
+    Reg[PID_REG_KD_POS] = (uint16_t)(Kd_Position[0] * 100.0f);
+    Reg[PID_REG_KP_ANG] = (uint16_t)(Kp_Angle[0] * 100.0f);
+    Reg[PID_REG_KI_ANG] = (uint16_t)(Ki_Angle[0] * 100.0f);
+    Reg[PID_REG_KD_ANG] = (uint16_t)(Kd_Angle[0] * 100.0f);
+    Reg[PID_REG_KP_SPD] = (uint16_t)(Kp_Speed[0] * 100.0f);
+    Reg[PID_REG_KI_SPD] = (uint16_t)(Ki_Speed[0] * 100.0f);
+    Reg[PID_REG_KD_SPD] = (uint16_t)(Kd_Speed[0] * 100.0f);
 }
 
 /**
@@ -150,9 +161,9 @@ void Motor_Init(void)
  */
 void Modbus_Timer_Loop(void)
 {
-    /* 200ms 步进的后台计时逻辑 (例如 1s 定时发送) */
+    /* 100ms 步进的后台计时逻辑 (例如 1s 定时发送) */
     modbus.Host_Sendtime++;
-    if (modbus.Host_Sendtime >= 5) { 
+    if (modbus.Host_Sendtime >= 10) { // 
         modbus.Host_time_flag = 1; // 1秒定时到达标志
         modbus.Host_Sendtime = 0;  // 自动复位计数器
 
@@ -162,9 +173,47 @@ void Modbus_Timer_Loop(void)
     }
 }
 
-__CCM_RAM_TEXT void Motor_Control_Loop(void)
+/**
+ * @brief 从 Modbus 寄存器 Reg[] 同步 PID 参数到全部 PID 结构体
+ *
+ * 缩放: Reg 值 ÷ 100.0f → PID 浮点参数
+ * 所有 4 电机共享相同参数, 同时更新
+ */
+void PID_UpdateGains(void)
+{
+    float kp_pos = (float)Reg[PID_REG_KP_POS] * 0.01f;
+    float ki_pos = (float)Reg[PID_REG_KI_POS] * 0.01f;
+    float kd_pos = (float)Reg[PID_REG_KD_POS] * 0.01f;
+    float kp_ang = (float)Reg[PID_REG_KP_ANG] * 0.01f;
+    float ki_ang = (float)Reg[PID_REG_KI_ANG] * 0.01f;
+    float kd_ang = (float)Reg[PID_REG_KD_ANG] * 0.01f;
+    float kp_spd = (float)Reg[PID_REG_KP_SPD] * 0.01f;
+    float ki_spd = (float)Reg[PID_REG_KI_SPD] * 0.01f;
+    float kd_spd = (float)Reg[PID_REG_KD_SPD] * 0.01f;
+
+    for (int i = 0; i < Motor_Num; i++) {
+        PID_Angle[i].Kp    = kp_ang;
+        PID_Angle[i].Ki    = ki_ang;
+        PID_Angle[i].Kd    = kd_ang;
+        PID_Speed[i].Kp    = kp_spd;
+        PID_Speed[i].Ki    = ki_spd;
+        PID_Speed[i].Kd    = kd_spd;
+    }
+    for (int i = 0; i < Hall_Num; i++) {
+        PID_Position[i].Kp = kp_pos;
+        PID_Position[i].Ki = ki_pos;
+        PID_Position[i].Kd = kd_pos;
+    }
+}
+
+void Motor_Control_Loop(void)
 {
     /* [2] 10ms 电机控制闭环逻辑 */
+        // 仅在 Modbus 写入了 PID 寄存器时才更新 (避免每 10ms 无效刷新)
+        if (pid_params_dirty) {
+            PID_UpdateGains();
+            pid_params_dirty = 0;
+        }
         uint8_t mode = Reg[4] >> 8;     // 从 Modbus 寄存器 Reg[4] 高 8 位获取运动模式
         uint8_t io_flag = Reg[4] & 0xFF; // 从 Modbus 寄存器 Reg[4] 低 8 位获取启停标志
 
@@ -218,8 +267,8 @@ __CCM_RAM_TEXT void Motor_Control_Loop(void)
                     motor[i].TargetAngle = sign * Real_OneTurn * (float)(Reg[i] >> 8);
                     
                     // 软限位：限制最大转动圈数为 40 圈
-                    if (motor[i].TargetAngle > Real_OneTurn * 40.0f) motor[i].TargetAngle = Real_OneTurn * 40.0f;
-                    if (motor[i].TargetAngle < -Real_OneTurn * 40.0f) motor[i].TargetAngle = -Real_OneTurn * 40.0f;
+                    if (motor[i].TargetAngle > Real_OneTurn * 60.0f) motor[i].TargetAngle = Real_OneTurn * 40.0f;
+                    if (motor[i].TargetAngle < -Real_OneTurn * 60.0f) motor[i].TargetAngle = -Real_OneTurn * 40.0f;
 
                     // 计算角度环输出 -> 得到目标速度
                     motor[i].TargetSpeed = PID_Increment(&PID_Angle[i], motor[i].CurrentAngle, motor[i].TargetAngle);
@@ -245,12 +294,17 @@ __CCM_RAM_TEXT void Motor_Control_Loop(void)
                     // 通过线性插值将目标物理角度转换为目标 ADC 值
                     motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i], CalibrationLEN, target_joint_angle, InterpolationFlag[i]);
                     // 位置环计算 -> 得到目标速度
-                    motor[i].TargetSpeed = -PID_Increment(&PID_Position[i], motor[i].CurrentPosition, motor[i].TargetPosition);
+                    motor[i].TargetSpeed = PID_Increment(&PID_Position[i], motor[i].CurrentPosition, motor[i].TargetPosition);
 
-                    // 死区处理：ADC 误差在 5 以内则停止
-                    if (PID_Position[i].Error_Last1 <= 5.0f && PID_Position[i].Error_Last1 >= -5.0f) motor[i].TargetSpeed = 0.0f;
+                    // 死区处理：ADC 误差在 5 以内则停止, 同时复位 PID 状态防止重启时跳变
+                    if (PID_Position[i].Error_Last1 <= 5.0f && PID_Position[i].Error_Last1 >= -5.0f) {
+                        motor[i].TargetSpeed = 0.0f;
+                        PID_Position[i].Out_Last = 0.0f;     // 复位积分累加
+                        PID_Position[i].Error_Last1 = 0.0f;  // 清零历史误差
+                        PID_Position[i].Error_Last2 = 0.0f;
+                    }
                     // 安全保护：若电机转动超过 40 圈则强制停止以防拉断
-                    if (motor[i].CurrentAngle < -40.0f * Real_OneTurn || motor[i].CurrentAngle > 40.0f * Real_OneTurn) motor[i].TargetSpeed = 0.0f;
+                    if (motor[i].CurrentAngle < -60.0f * Real_OneTurn || motor[i].CurrentAngle > 60.0f * Real_OneTurn) motor[i].TargetSpeed = 0.0f;
                     break;
                 }
                 default:
@@ -281,7 +335,7 @@ __CCM_RAM_TEXT void Motor_Control_Loop(void)
  * @param set_speed 控制增量值 (-1000 到 1000)。
  * @param flag 启停标志 (0: 停止, 非0: 运行)。
  */
-__CCM_RAM_TEXT void Set_Motor(uint8_t i, int16_t set_speed, uint8_t flag)
+void Set_Motor(uint8_t i, int16_t set_speed, uint8_t flag)
 {
     if (i >= Motor_Num) return;
     if (flag == 0) set_speed = 0; // 若 flag 为 0，则强制停止输出
@@ -366,7 +420,7 @@ float lineInterp(float xa[], float ya[], int length, float data, int flag)
  * @param Target 目标设定值。
  * @return float PID 控制器的输出增量。
  */
-__CCM_RAM_TEXT float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
+float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
 {
     float err = Target - Current;
     float proportion = err - PID->Error_Last1;
@@ -395,5 +449,7 @@ void Print_Motor_Status(uint8_t motor_index, uint8_t param)
         printf("Motor %d Target Speed: %.2f RPM, Actual Speed: %.2f RPM\r\n", motor_index + 1, motor[motor_index].TargetSpeed, motor[motor_index].CurrentSpeed);
     } else if (param == 2) {// 打印角度信息
         printf("Motor %d Target Angle: %.2f deg, Actual Angle: %.2f deg\r\n", motor_index + 1, motor[motor_index].TargetAngle , motor[motor_index].CurrentAngle);
+    }else if(param == 3){//打印目标位置和当前ADC值
+        printf("Motor %d Target Position: %.2f, Actual Position: %.2f\r\n", motor_index + 1, motor[motor_index].TargetPosition , motor[motor_index].CurrentPosition);
     }
 }//用于调试，定期打印电机状态信息，观察 PID 收敛情况和系统响应特性

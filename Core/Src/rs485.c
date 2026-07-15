@@ -3,11 +3,27 @@
 #include <stdio.h>
 #include <string.h>
 #include "cmsis_os.h"
+#include "FreeRTOS.h"
+#include "timers.h"
 
 MODBUS modbus;
 uint16_t Reg[100] __attribute__((section(".ccmram"))) = {0};
+volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[5..13] 时置 1
 
-//static uint8_t modbus_rx_byte; // 全局静态变量用于中断接收中转
+// LED 闪烁状态 (RS485 收发时双闪)
+static int led_blink_cnt = 0;  // 剩余闪烁次数 (0=空闲)
+
+// LED 闪烁定时器回调: 每 100ms 翻转 PE2, 4 次 = 2 闪 (400ms)
+void LedBlinkTimerCallback(void *argument)
+{
+    (void)argument;
+    HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_2);
+    if (++led_blink_cnt < 2) {
+        osTimerStart(ledBlinkTimerHandle, LED_BLINK_PERIOD_MS);
+    } else {
+        led_blink_cnt = 0;
+    }
+}
 
 /**
  * @brief 485 串口发送单字节 (保留原 API)
@@ -72,6 +88,14 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             (void)osMessageQueuePut(modbusRxQueueHandle, &frame, 0U, 0U);
         }
 
+        // RS485 收到数据 → 触发 LED 双闪 (ISR 内必须用 FromISR 版本)
+        led_blink_cnt = 0;
+        if (ledBlinkTimerHandle != NULL) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xTimerStartFromISR((TimerHandle_t)ledBlinkTimerHandle, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+
         // 2. 重新开启下一次接收 (DMA 模式设为 NORMAL 时需要重新开启)
         HAL_UARTEx_ReceiveToIdle_DMA(&huart1, modbus.rcbuf, MODBUS_BUF_SIZE);
     }
@@ -112,6 +136,13 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART1) {
         if (uartTxSemHandle != NULL) {
             (void)osSemaphoreRelease(uartTxSemHandle);
+        }
+        // RS485 发送完成 → 触发 LED 双闪 (ISR 内必须用 FromISR 版本)
+        led_blink_cnt = 0;
+        if (ledBlinkTimerHandle != NULL) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xTimerStartFromISR((TimerHandle_t)ledBlinkTimerHandle, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
         }
     }
 }
@@ -215,6 +246,7 @@ void Modbus_Func6(const uint8_t *buffer, uint16_t length)
     if (Regadd >= 100) return;
 
     Reg[Regadd] = val;
+    if (Regadd >= PID_REG_KP_POS && Regadd <= PID_REG_KD_SPD) pid_params_dirty = 1;
 
     modbus.sendbuf[send_len++] = modbus.myadd;
     modbus.sendbuf[send_len++] = 0x06;
@@ -256,6 +288,9 @@ void Modbus_Func16(const uint8_t *buffer, uint16_t length)
     {
         Reg[Regadd + i] = (uint16_t)(buffer[7 + i * 2] * 256U + buffer[8 + i * 2]);
     }
+    // 如果本次写入的寄存器区间与 PID 参数区间 [5,13] 有重叠, 打上脏标记
+    if (Regadd <= PID_REG_KD_SPD && (Regadd + Reglen) > PID_REG_KP_POS)
+        pid_params_dirty = 1;
 
     modbus.sendbuf[send_len++] = modbus.myadd;
     modbus.sendbuf[send_len++] = 0x10;

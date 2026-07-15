@@ -104,7 +104,6 @@ int main(void)
   MX_TIM6_Init();
   MX_USART1_UART_Init();
   MX_ADC1_Init();
-  MX_SPI1_Init();
   MX_TIM2_Init();
   MX_TIM8_Init();
   MX_TIM5_Init();
@@ -112,19 +111,20 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM7_Init();
   MX_USART2_UART_Init();
+  MX_ADC2_Init();
+  MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
   printf("(FreeRTOS Version)\r\n");
+  Modbus_Init(); // Modbus 协议栈初始化
   Modbus_Send_Byte('a'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
   Motor_Init();   // 电机初始化及 PID 参数设置
-
-  // ADC DMA 由 vSensorProcessTask 按需启动, 不再在初始化时持续运行
+  PL_Init();      // 12V 主电掉电检测初始化 (ADC2 IN4)
   //printf("系统外设启动成功, 准备调度RTOS任务\r\n");
   /* USER CODE END 2 */
 
   /* Init scheduler */
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
-  Modbus_Init();  // MODBUS协议初始化（DMA+IDLE），必须在消息队列创建之后执行
 
   /* Start scheduler */
   osKernelStart();

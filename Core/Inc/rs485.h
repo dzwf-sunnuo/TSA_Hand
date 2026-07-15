@@ -12,7 +12,21 @@
 #define MODBUS_BUF_SIZE 100
 #define MODBUS_RX_QUEUE_LENGTH 4
 
-#define RS485_SLAVE_ADDR 0x02 // 从机地址（可根据需要修改）
+#define RS485_SLAVE_ADDR 0x01 // 从机地址（可根据需要修改）
+
+// LED 闪烁参数: 4 次翻转 = 2 闪, 总时长 = BLINK_PERIOD × 4
+#define LED_BLINK_PERIOD_MS  50U
+
+// PID 参数 Modbus 寄存器索引 (Reg[5..13])
+#define PID_REG_KP_POS  5
+#define PID_REG_KI_POS  6
+#define PID_REG_KD_POS  7
+#define PID_REG_KP_ANG  8
+#define PID_REG_KI_ANG  9
+#define PID_REG_KD_ANG  10
+#define PID_REG_KP_SPD  11
+#define PID_REG_KI_SPD  12
+#define PID_REG_KD_SPD  13
 
 typedef struct
 {
@@ -41,6 +55,8 @@ typedef struct
 
 extern MODBUS modbus;
 extern uint16_t Reg[100];
+extern volatile uint8_t pid_params_dirty; /* PID 寄存器 (Reg[5..13]) 被写时置 1 */
+extern osTimerId_t ledBlinkTimerHandle;    /* RS485 收发触发的 LED 闪烁定时器 */
 extern osMessageQueueId_t modbusRxQueueHandle;
 extern osSemaphoreId_t uartTxSemHandle; // UART 发送完成信号量
 
@@ -48,6 +64,7 @@ extern osSemaphoreId_t uartTxSemHandle; // UART 发送完成信号量
 void Modbus_Send_Byte(uint8_t ch);
 void Modbus_Init(void);
 void Modbus_Event(const MODBUS_FrameTypeDef *frame);
+void LedBlinkTimerCallback(void *argument);  /* RS485 LED 双闪回调 */
 void Modbus_Func3(const uint8_t *buffer, uint16_t length);
 void Modbus_Func6(const uint8_t *buffer, uint16_t length);
 void Modbus_Func16(const uint8_t *buffer, uint16_t length);

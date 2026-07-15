@@ -51,8 +51,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-uint16_t ADC_NativeValue[80] = {0}; // DMA 目标缓冲区 (单次模式)
-__CCM_RAM_DATA uint16_t ADC_Snapshot[80] = {0};    // 完成回调中拷贝的快照
+uint16_t ADC_NativeValue[60] = {0}; // DMA 目标缓冲区 (4ch × 15样本)
+__CCM_RAM_DATA uint16_t ADC_Snapshot[60] = {0};    // 完成回调中拷贝的快照
 
 osMutexId_t xMotorDataMutexHandle;
 const osMutexAttr_t xMotorDataMutex_attributes = {
@@ -69,6 +69,12 @@ const osTimerAttr_t modbus1sTimer_attributes = {
   .name = "modbus1sTimer"
 };
 
+// LED 闪烁定时器 (RS485 收发触发双闪, 50ms 周期, 一次性)
+osTimerId_t ledBlinkTimerHandle;
+const osTimerAttr_t ledBlinkTimer_attributes = {
+  .name = "ledBlinkTimer"
+};
+
 // 注：暂时停用掉电延迟初始化定时器
 // osTimerId_t powerLossInitTimerHandle;
 // const osTimerAttr_t powerLossInitTimer_attributes = {
@@ -76,7 +82,6 @@ const osTimerAttr_t modbus1sTimer_attributes = {
 // };
 
 osThreadId_t motorControlTaskHandle;
-// 电机控制任务使用静态分配: TCB + 栈全部放入 CCMRAM (零等待)
 __CCM_RAM_DATA static StaticTask_t motorControlTask_TCB;
 __CCM_RAM_DATA static StackType_t motorControlTask_Stack[512];  // 512 words = 2KB
 const osThreadAttr_t motorControlTask_attributes = {
@@ -149,6 +154,8 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_TIMERS */
   // 使用 1s 定时器触发 Modbus 定时事件
   modbus1sTimerHandle = osTimerNew(Modbus1sTimerCallback, osTimerPeriodic, NULL, &modbus1sTimer_attributes);
+  // RS485 LED 闪烁定时器 (一次性, 由 RS485 收发回调启动)
+  ledBlinkTimerHandle  = osTimerNew(LedBlinkTimerCallback, osTimerOnce, NULL, &ledBlinkTimer_attributes);
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -160,7 +167,7 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  // 静态创建电机控制任务: TCB + 栈全在 CCMRAM, 无堆分配碎片风险
+  // 静态创建电机控制任务
   motorControlTaskHandle  = (osThreadId_t)xTaskCreateStatic(
       vMotorControlTask, "motorControl", 512, NULL,
       osPriorityRealtime, motorControlTask_Stack, &motorControlTask_TCB);
@@ -207,10 +214,9 @@ void StartDefaultTask(void *argument)
   * @retval None
   * @note 绝对的 10ms 周期执行闭环 PID 计算
   */
-__CCM_RAM_TEXT void vMotorControlTask(void *argument)
+void vMotorControlTask(void *argument)
 {
   uint32_t PreviousWakeTime = osKernelGetTickCount();
- // uint32_t i = 0,j = 0; 
   for(;;)
   {
     // 绝对延时周期 (由 CONTROL_FREQ_HZ 决定), 确保控制环路稳定
@@ -219,18 +225,9 @@ __CCM_RAM_TEXT void vMotorControlTask(void *argument)
 
     // 获取互斥锁，保护串口指令与本地闭环计算的数据安全
     if (xMotorDataMutexHandle != NULL) {
-     // i = osKernelGetTickCount();
       osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
       Motor_Control_Loop(); // 执行电机位置/速度内环闭环计算并输出PWM
-      // 掉电保存相关功能已停用，如需恢复请取消注释并启用 timer
-      // PL_SaveAngles();        // 将当前角度写入备份寄存器 (双槽交替, ~30μs)
       osMutexRelease(xMotorDataMutexHandle);
-     /* i = osKernelGetTickCount() - i;
-      j++;
-      if(j > 50) {
-        printf("Motor Control Loop Execution Time: %lu ms\r\n", i);
-        j = 0;
-      }在这里测试了一下一次电机控制循环要多长时间，实测i==0，用时<1ms,并且在一个时间片里面任务可以完成*/
     }
   }
 }
@@ -269,76 +266,22 @@ void vModbusCommTask(void *argument)
   }
 }
 
-/* ================================================================
- *  快速排序 (uint16_t)
- *
- *  标准 Hoare 分区方案。对 20 个元素的小数组, 快速排序
- * 
- *
- *  调用: quicksort(arr, 0, n-1)
- * ================================================================ */
-
-static void swap_u16(uint16_t *a, uint16_t *b)
-{
-    uint16_t t = *a;
-    *a = *b;
-    *b = t;
-}
-
-/**
- * @brief 分区: 以最右元素为 pivot, 小于 pivot 的放左边, 大于的放右边
- * @return pivot 最终位置
- */
-static int partition(uint16_t *arr, int left, int right)
-{
-    uint16_t pivot = arr[right];  // 选最右元素为基准
-    int i = left - 1;             // i 指向"小于区"的尾部
-
-    for (int j = left; j < right; j++) {
-        if (arr[j] <= pivot) {
-            i++;
-            swap_u16(&arr[i], &arr[j]);
-        }
-    }
-    swap_u16(&arr[i + 1], &arr[right]);  // pivot 归位
-    return i + 1;
-}
-
-/**
- * @brief 快速排序 (递归)
- * @param arr   待排序数组
- * @param left  左边界 (含)
- * @param right 右边界 (含)
- */
-static void quicksort(uint16_t *arr, int left, int right)
-{
-    if (left >= right) return;
-
-    int pivot_idx = partition(arr, left, right);
-
-    quicksort(arr, left, pivot_idx - 1);   // 排左边
-    quicksort(arr, pivot_idx + 1, right);  // 排右边
-}
-
 /**
  * @brief 传感器处理任务 (普通优先级)
  *
- * 每 10ms 启动一次 ADC DMA 单次采集 (4 通道 × 20 样本),
- * 等待完成回调 → 快速排序 + 裁剪均值滤波 → 写入 ADC_HallValue[]。
- *
- * DMA 为单次模式, 仅在采集期间运行 (~152μs), 其余时间 ADC 空闲。
+ * 每 10ms 启动一次 ADC DMA 单次采集 (4 通道 × 15 样本),
+ * 等待完成回调 → 滑动窗口均值滤波 → 写入 ADC_HallValue[]。
  */
 void vSensorProcessTask(void *argument)
 {
-  uint16_t local[80];
-  uint16_t sorted[20];
+  uint16_t local[60];
   uint8_t i, j;
   uint32_t sum;
 
   for(;;)
   {
-    // 启动单次 DMA 采集 (4 通道 × 20 样本 ≈ 152μs)
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)ADC_NativeValue, 80);
+    // 启动单次 DMA 采集 (4 通道 × 15 样本)
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)ADC_NativeValue, 60);
 
     // 等待 DMA 完成 (超时 50ms 为安全兜底)
     if (osSemaphoreAcquire(Sem_ADC_Done, 50) != osOK) {
@@ -347,31 +290,31 @@ void vSensorProcessTask(void *argument)
     }
 
     // 拷贝快照到本地栈
-    for (i = 0; i < 80; i++) {
+    for (i = 0; i < 60; i++) {
       local[i] = ADC_Snapshot[i];
     }
 
+    // 滑动窗口均值: 每通道 15 样本直接求和取平均
+    // 加锁写入, 保证控制任务和监控任务读到一致的 ADC_HallValue[]
+    if (xMotorDataMutexHandle != NULL) {
+      osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
+    }
     for (j = 0; j < 4; j++) {
-
-      for (i = 0; i < 20; i++) {
-        sorted[i] = local[4 * i + j];
-      }
-
-      quicksort(sorted, 0, 19);
-
-      // 裁剪均值: 去头尾各 4, 中间 12 取平均
       sum = 0;
-      for (i = 4; i < 16; i++) {
-        sum += sorted[i];
+      for (i = 0; i < 15; i++) {
+        sum += local[4 * i + j];
       }
-      ADC_HallValue[j] = (uint16_t)(sum / 12);
+      ADC_HallValue[j] = (uint16_t)(sum / 15);
+    }
+    if (xMotorDataMutexHandle != NULL) {
+      osMutexRelease(xMotorDataMutexHandle);
     }
 
-    osDelay(5);  // 5ms 后进入下一轮采集
+    osDelay(10);  // 10ms 后进入下一轮采集
   }
 }
 
-static char pcwritebuff[256]; // 用于打印任务栈大小的缓冲区
+//static char pcwritebuff[256]; // 用于打印任务栈大小的缓冲区
 /**
   * @brief 系统监视及低频定时任务 (低优先级)
   * @param argument: 未使用
@@ -381,17 +324,35 @@ static char pcwritebuff[256]; // 用于打印任务栈大小的缓冲区
 void vSystemMonitorTask(void *argument)
 {
   uint32_t PreviousWakeTime = osKernelGetTickCount();
-  //int i = 3; // 监视电机 i-1 的状态
+  int pl_was_lost = 0;  // 掉电恢复标志
   for(;;)
   {
-    // 200ms 的 Modbus 定时节拍器
-    osDelayUntil(PreviousWakeTime + 200); 
-    /*打印电机1的目标速度，实际速度，目标位置，实际位置*/
-    vTaskList(pcwritebuff);
-    printf("Task List:\r\n%s\r\n", pcwritebuff);
-   //Print_Motor_Status(i, 1); // 打印速度状态
-    Modbus_Timer_Loop(); // 更新 Modbus 超时接收和 1s 定时发送计时器，其实超时接收已经被IDLE中断回调处理了
+    // 100ms 周期监控
+    osDelayUntil(PreviousWakeTime + 100);
     PreviousWakeTime = osKernelGetTickCount();
+
+    // 12V 主电掉电检测 (ADC2 IN4, 100ms 轮询 + 2 次消抖 = 200ms)
+    if (!PL_Is12VAlive()) {
+      if (!pl_was_lost) {
+        PL_EmergencyStop();  // 首次掉电: 刹停 + 关 LED
+        pl_was_lost = 1;
+      }
+      continue;  // 掉电中, 跳过 Modbus 计时
+    }
+
+    // 12V 恢复
+    if (pl_was_lost) {
+      PL_Resume();         // 开 LED
+      pl_was_lost = 0;
+    }
+    // 加锁快照, 保证 CurrentPosition 与 Hall Value 来自同一拍
+    if (xMotorDataMutexHandle != NULL) {
+      osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
+      uint16_t hall0 = ADC_HallValue[0];  // 权威值: 先快照
+      Print_Motor_Status(0, 3);           // 打印 Target/Actual Position
+      printf("Hall Value 0: %d\r\n", hall0);
+      osMutexRelease(xMotorDataMutexHandle);
+    }
 
   }
 }
@@ -418,6 +379,22 @@ void Modbus1sTimerCallback(void *argument)
     (void)argument;
     // 功能被禁用 -- 原实现已注释
   }
+
+/**
+ * @brief ADC DMA 完成回调 — 快照 + 信号量唤醒
+ *
+ * DMA 单次模式, 由 vSensorProcessTask 启动, 完成后触发此回调。
+ * 频率 = 任务频率 (10ms → 100 Hz), 不会淹没调度器。
+ */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance != ADC1) return;
+
+    for (int i = 0; i < 60; i++) {
+        ADC_Snapshot[i] = ADC_NativeValue[i];
+    }
+    osSemaphoreRelease(Sem_ADC_Done);
+}
 
 /* USER CODE END Application */
 

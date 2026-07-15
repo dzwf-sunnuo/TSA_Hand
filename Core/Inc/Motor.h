@@ -15,6 +15,8 @@
 #define CONTROL_FREQ_HZ         100     // 100Hz = 10ms 控制周期
 #define CONTROL_PERIOD_TICKS    (1000 / CONTROL_FREQ_HZ)  // FreeRTOS tick 数 (tick=1kHz)
 
+// PID 参数 Modbus 寄存器宏已移至 rs485.h
+
 /* 电机物理特性常量 */
 #define Real_OneTurn 365.0f     // 减速后输出轴转动一圈对应的编码器计数值(已换算为角度)
 #define Real_MaxSpeed 50.0f      // 电机运行允许的最大速度？
@@ -93,6 +95,12 @@ void Modbus_Timer_Loop(void);
 float PID_Increment(PID_Increment_Struct *PID, float Current, float Target);
 
 /**
+ * @brief 从 Reg[] 同步 PID 参数到全部 PID 结构体
+ * 在 Motor_Control_Loop 开头调用, Reg 值 ÷100.0f 写入 Kp/Ki/Kd
+ */
+void PID_UpdateGains(void);
+
+/**
  * @brief 底层电机驱动输出
  * @param i 电机索引
  * @param set_speed 控制增量 (-1000 到 1000)
@@ -115,5 +123,5 @@ float Get_Angle(uint8_t i);
  * 用于将目标物理角度映射为非线性的传感器 ADC 值
  */
 float lineInterp(float xa[], float ya[], int length, float data, int flag);
-
+void Print_Motor_Status(uint8_t motor_index, uint8_t param);
 #endif
