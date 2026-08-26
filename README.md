@@ -1,137 +1,185 @@
-# SRY_Slave_FreeRTOS — 灵巧手从机驱动板 (FreeRTOS)
+# FR_Hand_s_ts — 带触觉传感器的灵巧手从板
 
-FreeRTOS 实时操作系统驱动的灵巧手手指从机固件。运行于 STM32F407VETx (Cortex-M4F)，通过 Modbus RTU over RS485 接收主板指令，独立完成 4 路电机的闭环控制。
+`FR_Hand_s_ts` 是灵巧手从板固件的触觉版本，运行于 STM32F407VETx。固件负责 4 路手指电机闭环控制，并通过 SPI3 读取三维力传感器，使食指能够执行基于触觉反馈的导纳控制。
 
-## 硬件平台
+上位机既可以通过 RS485/Modbus RTU 直连本从板，也可以经 `FR_Hand_m` 主板转发电机控制寄存器。
 
-| 项 | 规格 |
+> 上位机控制模式、完整 Modbus 帧和参数调节方法请参阅 [导纳控制上位机指令说明](docs/Admittance_Control_Protocol.md)。
+
+## 项目关系
+
+| 工程 | 作用 |
 |---|---|
-| MCU | STM32F407VETx (Cortex-M4F, 168MHz) |
-| Flash | 512 KB |
-| RAM | 128 KB + 64 KB CCMRAM |
-| RTOS | FreeRTOS V10.3.1 (CMSIS-OS V2 API, heap_4) |
-| 通信 | RS485 (USART1, 115200) + Modbus RTU |
-| 调试 | USART2, 115200 (printf) |
-| 驱动电机数 | 4 路 (食指/中指/无名指/小指) |
+| `FR_Hand_s` | 普通从板，负责手指电机驱动 |
+| `FR_Hand_s_ts` | 本工程；在普通从板基础上增加触觉传感器和导纳控制 |
+| `FR_Hand_m` | 主板，负责手腕关节驱动、上位机通信和从板指令转发 |
+| `helmat` | 触觉反馈头盔，通过 PWM 驱动 SMA 触点运动 |
 
-## 目录结构
+## 硬件与通信
 
-```
-SRY_Slave_FreeRTOS/
-├── Core/                       # 应用层源码 (用户代码 + CubeMX 生成)
-│   ├── Inc/                    # 头文件
-│   │   ├── Motor.h             #   电机控制结构体 & API 声明
-│   │   ├── rs485.h             #   Modbus 协议栈 & RS485 宏
-│   │   ├── rs485_crc.h         #   Modbus CRC16 查表
-│   │   ├── FreeRTOSConfig.h    #   FreeRTOS 内核配置
-│   │   └── *.h                 #   外设初始化头 (CubeMX 生成)
-│   └── Src/                    # 源文件
-│       ├── main.c              #   入口: 硬件初始化 → RTOS 调度器启动
-│       ├── freertos.c          #   4 个 RTOS 任务体 + 互斥锁创建
-│       ├── Motor.c             #   级联 PID + PWM 输出 + 编码器读取
-│       ├── rs485.c             #   Modbus 帧解析 (DMA+IDLE 中断)
-│       ├── rs485_crc.c         #   CRC16 计算
-│       └── *.c                 #   外设初始化 (CubeMX 生成)
-├── Drivers/                    # STM32 HAL 库 + CMSIS
-│   ├── STM32F4xx_HAL_Driver/   #   HAL 驱动
-│   └── CMSIS/                  #   Cortex-M4 内核接口
-├── Middlewares/                # 第三方中间件
-│   └── Third_Party/FreeRTOS/   #   FreeRTOS 内核源码
-├── cmake/                      # CMake 工具链 & 构建脚本
-│   ├── gcc-arm-none-eabi.cmake #   GCC ARM 交叉编译工具链
-│   └── stm32cubemx/            #   CubeMX 生成的 CMake 子工程
-├── build/                      # 构建输出 (CMake 生成, gitignore)
-├── FR_Hand_s.ioc               # CubeMX 工程文件 (引脚配置 & 时钟树)
-├── CMakeLists.txt              # 顶层 CMake 构建定义
-├── CMakePresets.json           # CMake 预设配置
-├── STM32F407XX_FLASH.ld        # 链接脚本
-├── startup_stm32f407xx.s       # 启动文件 (中断向量表 + Reset_Handler)
-├── PID.py                      # PID 参数整定辅助脚本
-└── Figure_1/2.png              # 调试截图
-```
+| 项目 | 当前配置 |
+|---|---|
+| MCU | STM32F407VETx，Cortex-M4F，168 MHz |
+| RTOS | FreeRTOS V10.3.1，CMSIS-RTOS V2 API |
+| 电机 | 4 路直流电机，级联闭环控制 |
+| 关节位置 | 4 路 ADC 霍尔传感器 |
+| 触觉传感器 | 三维力传感器，目前接入电机 0（食指） |
+| 触觉接口 | SPI3：PC10/SCK、PC11/MISO、PC12/MOSI，PA12/CS |
+| 微秒延时 | TIM13，为触觉传感器 SPI 时序提供延时 |
+| 上位机通信 | USART1，RS485，Modbus RTU，115200 bit/s，8N1 |
+| 调试输出 | USART2，115200 bit/s |
+| Modbus 地址 | 默认 `0x01` |
+| 支持功能码 | `0x03`、`0x06`、`0x10` |
 
-## 构建
+SPI3 和 TIM13 在系统启动时完成初始化。触觉传感器也会在电机模块初始化时完成注册，不需要上位机单独发送“开启 SPI”指令；进入模式 6 或模式 7 后，控制循环才会持续读取触觉力并参与导纳计算。
 
-```bash
-cd SRY_Slave_FreeRTOS
-cmake -B build/Debug -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -G Ninja
-cmake --build build/Debug
-```
+## 控制模式
 
-输出: `build/Debug/FR_Hand_s.elf`
-
-依赖: `arm-none-eabi-gcc` (GCC Arm Embedded), `ninja`, `cmake` ≥ 3.22
-
-注意: 此项目**不再使用** Keil MDK-ARM 构建。原始裸机工程 (`SRY_Slave_Keil/`) 仍保留 Keil 工程作为历史参考。
-
-## RTOS 任务架构
-
-```
-优先级: Realtime > High > Normal > Low
-         ↓         ↓      ↓        ↓
-    vMotorControl  vModbus  vSensor  vSystemMonitor
-    (10ms PID)    (Modbus) (20ms ADC)  (20ms misc)
-```
-
-| 任务 | 优先级 | 周期 | 职责 |
-|---|---|---|---|
-| `vMotorControlTask` | `osPriorityRealtime` | 10ms 绝对周期 | 4 路电机级联 PID (位置环→角度环→速度环) + PWM 更新 |
-| `vModbusCommTask` | `osPriorityHigh` | 事件驱动 (DMA+IDLE) | Modbus RTU 帧解析, 寄存器读写 (功能码 03/06/16) |
-| `vSensorProcessTask` | `osPriorityNormal` | 20ms | ADC 4 通道滑动平均滤波 (20 样本/通道) |
-| `vSystemMonitorTask` | `osPriorityLow` | 20ms 绝对周期 | Modbus 帧超时, 心跳, debug printf |
-
-**同步机制**: `xMotorDataMutex` 保护共享的 `motor[]` 状态数组和 `Reg[]` 寄存器数组。控制任务持锁执行完整 PID 周期；通信任务以 10ms 超时尝试获取锁。
-
-## 电机控制模式
-
-模式由 `Reg[4]` 高 8 位 (`Reg[4] >> 8`) 选择:
+控制模式由 `Reg[4]` 的高字节选择，低字节为输出使能：低字节为 `0` 时停止输出，非 `0` 时允许运行。
 
 | 模式 | 说明 |
-|---|---|
-| 1 | 正向出轴角度控制 (`Reg[i] >> 8` = 目标圈数, 软限位 50 圈) |
-| 3 | 反向出轴角度控制 |
-| 4 | 紧急停止 + 编码器清零 |
-| 5 | 关节角度插值控制（四位压缩BCD：`0x0300`表示30.0°） |
-| 6 | 输出轴角度导纳控制（触觉传感器作用于电机0） |
-| 7 | 关节角度导纳控制（四位压缩BCD，触觉传感器作用于电机0） |
+|---:|---|
+| 1 | 正向输出轴角度控制；目标圈数位于 `Reg[0..3]` 高字节 |
+| 3 | 反向输出轴角度控制 |
+| 4 | 紧急停止并清零编码器 |
+| 5 | 普通关节角度控制，目标角度采用四位压缩 BCD |
+| 6 | 输出轴角度导纳控制，触觉反馈仅作用于电机 0 |
+| 7 | 关节角度导纳控制，触觉反馈仅作用于电机 0，推荐上位机使用 |
 
-`Reg[i] & 0xFF` 为速度百分比 (仅模式 1/3 生效)。
+### 模式 5 和模式 7 的角度格式
 
-模式5/7的BCD角度有效范围为`0x0050～0x0900`，对应`5.0°～90.0°`。如果任一半字节大于9，固件会拒绝该目标并立即停止对应电机。模式7检测到触觉合力超过15N时，会停止食指当前输出，并切换到模式5的`0x0050`安全位置。
+目标角度使用四位压缩 BCD，而不是普通十六进制数值：
 
-## 关键文件
-
-| 文件 | 内容 |
-|---|---|
-| `Core/Inc/FreeRTOSConfig.h` | `configENABLE_FPU=1` (必须!), tick=1kHz, max priority=56, heap_4 |
-| `Core/Inc/Motor.h` | `Motor_Struct`, `PID_Increment_Struct`, `Motor_HW_Config` 定义 |
-| `Core/Inc/rs485.h` | `MODBUS` 结构体, `Reg[100]` 寄存器数组, RS485 方向控制宏 |
-| `Core/Src/freertos.c` | 4 个 RTOS 任务函数体 + `xMotorDataMutex` 创建 |
-| `Core/Src/Motor.c` | `Motor_Control_Loop()` (级联 PID), `Set_Motor()` (PWM 输出), `Motor_Init()` |
-| `Core/Src/rs485.c` | `Modbus_Event()`, `Modbus_Func3/6/16()`, UART DMA+IDLE 回调 |
-| `Core/Src/main.c` | 硬件初始化顺序, RTOS 启动 |
-
-## 与其他项目的关系
-
-```
-SRY_Master_FreeRTOS (主板)  ──RS485──>  FR_Hand_s (本机)   ← 手指从机
-     │
-     ├── 一个主板管理 2 块从机板:
-     │    slave 0x01 = 拇指板 (ban1)
-     │    slave 0x02 = 其余四指板 (ban2)
-     │    每块从机板有 4 路电机 (FR_Hand_s)
-     │
-     └── SRY_Slave_Keil/
-         og_s/   ← 旧版裸机从机 (保留作为历史参考)
+```text
+0x0050 =  5.0°
+0x0300 = 30.0°
+0x0555 = 55.5°
+0x0900 = 90.0°
 ```
 
-本仓库内各分支关系:
+有效范围为 `5.0°～90.0°`。每个十六进制位都必须是 `0～9`；例如 `0x03AF` 是非法 BCD，固件会拒绝该目标并立即停止对应电机。模式 6 仍沿用原有的圈数/速度编码，不使用 BCD。
 
-| 分支 | 角色 | 状态 |
-|---|---|---|
-| `SRY_Slave_FreeRTOS` | FreeRTOS 从机驱动板 | **当前主要开发目标** |
-| `SRY_Master_Keil` | FreeRTOS 主板 (Modbus/CAN/IR) | 开发中 |
-| `SRY_Slave_Keil` | 原始裸机从机 (裸机) | 历史参考 |
-| `SRY_Master_Keil` | 上一代主板 (裸机 + CAN) | 历史参考 |
-| `CZZ_Slave1` / `CZZ_Master1` | 更早版本 | 归档 |
+## 触觉导纳控制
+
+当前实现提供两种触觉导纳模式：
+
+- 模式 6：电机 0 以输出轴圈数为基准，根据触觉力产生退让量。
+- 模式 7：电机 0 以关节角度为基准，根据触觉力减小目标角度；其余电机执行普通关节角度控制。
+
+控制周期为 `10 ms`，触觉力小于 `0.05 N` 时进入死区。当前默认导纳参数为：
+
+| 寄存器 | 参数 | 上电值 | 实际值 |
+|---:|---|---:|---:|
+| `Reg[15]` | 接触刚度 `K_contact` | `0x0020`（32） | `0.032` |
+| `Reg[16]` | 回弹刚度 `K_return` | `0x03E8`（1000） | `1.000` |
+| `Reg[17]` | 虚拟阻尼 `B_damp` | `0x0010`（16） | `0.016` |
+
+三个参数均按“寄存器值 × `0.001`”换算。上位机直连从板时，可使用以下指令一次写入默认值：
+
+```text
+01 10 00 0F 00 03 06 00 20 03 E8 00 10 D6 CB
+```
+
+## Modbus 快速示例
+
+以下帧均已包含 Modbus CRC16，CRC 低字节在前。示例假设从机地址为 `0x01`。
+
+### 四个关节以 30.0° 为基准启动模式 7
+
+```text
+01 10 00 00 00 05 0A 03 00 03 00 03 00 03 00 07 01 72 65
+```
+
+其中 `Reg[0..3] = 0x0300`，`Reg[4] = 0x0701`。
+
+### 停止全部 PWM 输出
+
+```text
+01 06 00 04 00 00 C8 0B
+```
+
+### 回到 5.0° 并切换至普通关节角度模式
+
+```text
+01 10 00 00 00 05 0A 00 50 00 50 00 50 00 50 05 01 AF 73
+```
+
+自定义角度、参数以及经主板转发的完整示例见 [docs/Admittance_Control_Protocol.md](docs/Admittance_Control_Protocol.md)。
+
+## 经 FR_Hand_m 主板控制时的限制
+
+当前主板仅转发每块从板的 `Reg[0..4]`：
+
+| 主板寄存器 | 转发目标 |
+|---|---|
+| `Reg[4..8]` | 从板 `0x01` 的 `Reg[0..4]` |
+| `Reg[9..13]` | 从板 `0x02` 的 `Reg[0..4]` |
+
+因此，经主板可以启动模式 6/7、设置目标角度和停止电机，但不能修改从板的 `Reg[15..17]` 导纳参数。修改参数时需要直连从板、调整固件默认值，或扩展主板转发协议。
+
+## 安全行为与已知限制
+
+- 当触觉合力超过 `15 N` 时，电机 0 会立即停止当前导纳输出并转到安全控制状态：模式 7 切换为模式 5，目标位置设为 `5.0°`。
+- 模式 7 的导纳最大退让量为 `40°`，关节目标被限制在 `5.0°～90.0°`。
+- 编码器累计角度超过正负 60 圈时，固件停止对应电机。
+- 系统检测到 12 V 主电掉电时会执行紧急停止，供电恢复后重新允许控制。
+- 当前只有电机 0 使用触觉传感器，`Fx`、`Fy`、`Fz` 和合力尚未映射到 Modbus 寄存器；上位机不能通过功能码 `0x03` 读取实时触觉力。
+- 模式 6 不会根据 `Reg[1..3]` 重新生成电机 1～3 的目标位置，使用前必须确认这些电机已经处于安全目标位置。
+
+## FreeRTOS 任务架构
+
+| 任务 | 优先级 | 周期/触发方式 | 职责 |
+|---|---|---|---|
+| `vMotorControlTask` | Realtime | 10 ms | 四路电机闭环、触觉采样、导纳计算和 PWM 更新 |
+| `vModbusCommTask` | High | DMA + IDLE 事件驱动 | Modbus RTU 帧解析和寄存器读写 |
+| `vSensorProcessTask` | Normal | 20 ms | 四路 ADC 数据滤波 |
+| `vSystemMonitorTask` | Low | 20 ms | 通信超时、掉电保护、心跳和调试输出 |
+
+共享的电机状态与 Modbus 寄存器由 `xMotorDataMutex` 保护。
+
+## 主要文件
+
+| 文件 | 作用 |
+|---|---|
+| `Core/Src/Motor.c` | 电机模式、级联控制、触觉导纳和安全保护 |
+| `Core/Src/Tactile_Sensor.c` | SPI 触觉传感器初始化、采样与力值计算 |
+| `Core/Src/admittance.c` | 一阶导纳模型 |
+| `Core/Src/angle_codec.c` | 模式 5/7 的 BCD 角度解码与合法性检查 |
+| `Core/Src/rs485.c` | Modbus RTU 协议处理 |
+| `Core/Src/freertos.c` | FreeRTOS 任务与互斥锁 |
+| `Core/Src/power_loss.c` | 12 V 掉电检测与保护 |
+| `docs/Admittance_Control_Protocol.md` | 上位机导纳控制指令手册 |
+| `tests/test_angle_codec.c` | BCD 角度编码宿主机单元测试 |
+
+## 编译固件
+
+依赖 CMake 3.22 或更高版本、Ninja 和 Arm GNU Toolchain：
+
+```bash
+cmake --preset Debug
+cmake --build --preset Debug
+```
+
+生成文件位于 `build/Debug/FR_Hand_s.elf`。
+
+## 运行宿主机测试
+
+BCD 角度编解码测试不依赖 STM32 硬件，可使用本机 C 编译器运行：
+
+```bash
+cmake -S tests -B build/host-tests
+cmake --build build/host-tests
+ctest --test-dir build/host-tests --output-on-failure
+```
+
+## 推荐上位机操作顺序
+
+1. 确认串口参数和从机地址。
+2. 读取 `Reg[0..17]`，确认 Modbus 通信正常。
+3. 直连从板设置 `Reg[15..17]`；初次测试建议保留默认参数。
+4. 使用模式 5 将四个关节移动到安全基准位置。
+5. 发送模式 7 启动帧并缓慢施加外力。
+6. 调参时每次只修改一个参数，并提前准备停止帧。
+7. 测试结束后将 `Reg[4]` 写为 `0x0000`。
+
+首次联调前请完整阅读 [导纳控制上位机指令说明](docs/Admittance_Control_Protocol.md)，并确保机构留有足够的安全行程。
