@@ -48,6 +48,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/rs485.c
     Core/Src/rs485_crc.c
     Core/Src/power_loss.c
+    Core/Src/admittance.c
+    Core/Src/Tactile_Sensor.c
+    Core/Src/angle_codec.c
 )
 
 # Add include paths

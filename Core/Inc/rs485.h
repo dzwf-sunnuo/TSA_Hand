@@ -28,6 +28,11 @@
 #define PID_REG_KI_SPD  12
 #define PID_REG_KD_SPD  13
 
+// 导纳控制参数寄存器 (case 6)
+#define ADM_REG_K  15    // 接触刚度 ×1000
+#define ADM_REG_B  16    // 回弹刚度 ×1000
+#define ADM_REG_DAMP 17  // 虚拟阻尼 ×1000 (16=0.016, 越小响应越快)
+
 typedef struct
 {
     uint16_t length;

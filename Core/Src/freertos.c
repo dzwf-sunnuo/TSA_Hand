@@ -270,7 +270,8 @@ void vModbusCommTask(void *argument)
  * @brief 传感器处理任务 (普通优先级)
  *
  * 每 10ms 启动一次 ADC DMA 单次采集 (4 通道 × 15 样本),
- * 等待完成回调 → 滑动窗口均值滤波 → 写入 ADC_HallValue[]。
+ * DMA 正常模式: 传输完成自动停止, ISR 快照 → 滑动窗口均值滤波 → 写入 ADC_HallValue[],
+ * 最后调用 Stop_DMA 为下一轮准备干净状态。
  */
 void vSensorProcessTask(void *argument)
 {
@@ -310,6 +311,9 @@ void vSensorProcessTask(void *argument)
       osMutexRelease(xMotorDataMutexHandle);
     }
 
+    // 停止 ADC + DMA, 为下一轮 Start_DMA 准备干净的状态
+    HAL_ADC_Stop_DMA(&hadc1);
+
     osDelay(10);  // 10ms 后进入下一轮采集
   }
 }
@@ -328,7 +332,7 @@ void vSystemMonitorTask(void *argument)
   for(;;)
   {
     // 100ms 周期监控
-    osDelayUntil(PreviousWakeTime + 100);
+    osDelayUntil(PreviousWakeTime + 500);
     PreviousWakeTime = osKernelGetTickCount();
 
     // 12V 主电掉电检测 (ADC2 IN4, 100ms 轮询 + 2 次消抖 = 200ms)
@@ -345,17 +349,12 @@ void vSystemMonitorTask(void *argument)
       PL_Resume();         // 开 LED
       pl_was_lost = 0;
     }
-    // 加锁快照, 保证 CurrentPosition 与 Hall Value 来自同一拍
-    if (xMotorDataMutexHandle != NULL) {
-      osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
-      uint16_t hall0 = ADC_HallValue[0];  // 权威值: 先快照
-      Print_Motor_Status(0, 3);           // 打印 Target/Actual Position
-      printf("Hall Value 0: %d\r\n", hall0);
-      osMutexRelease(xMotorDataMutexHandle);
+      //uint16_t hall0 = ADC_HallValue[0];  // 权威值: 先快照
+      Print_Motor_Status(0, 4);           // 打印 Target/Actual Position
     }
 
   }
-}
+
 
 /**
  * @brief 1s 定时器回调：设置 Modbus 周期性标志（事件驱动替代计时累加）
@@ -381,9 +380,10 @@ void Modbus1sTimerCallback(void *argument)
   }
 
 /**
- * @brief ADC DMA 完成回调 — 快照 + 信号量唤醒
+ * @brief ADC DMA 传输完成回调 — 快照 + 信号量唤醒
  *
- * DMA 单次模式, 由 vSensorProcessTask 启动, 完成后触发此回调。
+ * DMA 正常模式 (非循环), 完成 60 次半字传输后硬件自动停止。
+ * 此时 ADC_NativeValue[] 已稳定, 拷贝到 ADC_Snapshot(CCM) 无竞态。
  * 频率 = 任务频率 (10ms → 100 Hz), 不会淹没调度器。
  */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)

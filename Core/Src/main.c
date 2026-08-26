@@ -113,10 +113,12 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC2_Init();
   MX_SPI3_Init();
+  MX_TIM13_Init();
   /* USER CODE BEGIN 2 */
   printf("(FreeRTOS Version)\r\n");
   Modbus_Init(); // Modbus 协议栈初始化
   Modbus_Send_Byte('a'); // 发送一个字节，触发上位机的接收中断，验证串口和DMA配置正确
+  HAL_TIM_Base_Start(&htim13); // 启动 TIM13 自由运行计数器 (Tactile_DelayUs 依赖)
   Motor_Init();   // 电机初始化及 PID 参数设置
   PL_Init();      // 12V 主电掉电检测初始化 (ADC2 IN4)
   //printf("系统外设启动成功, 准备调度RTOS任务\r\n");

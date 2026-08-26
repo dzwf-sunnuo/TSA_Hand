@@ -4,6 +4,13 @@
 #include "usart.h"
 #include "rs485.h"
 #include "rs485_crc.h"
+#include "admittance.h"
+#include "Tactile_Sensor.h"
+#include "angle_codec.h"
+
+/* 导纳控制全局变量 */
+__CCM_RAM_DATA static Admittance_Ctrl adm_ctrl;
+__CCM_RAM_DATA Tactile_Sensor_t finger0_sensor;
 
 /* 堵转保护 */
 #define STALL_TIMEOUT_SECONDS 3.0f   // 堵转判定时间 (秒)
@@ -72,9 +79,9 @@ __CCM_RAM_DATA static float ADValue[4][CalibrationLEN] = {
 __CCM_RAM_DATA static int InterpolationFlag[4] = {11, 11, 11, 11} ; // 插值搜索方向标志
 
 /* PID 初始参数 */
-__CCM_RAM_DATA float Kp_Position[Hall_Num]  = {0.5f, 0.5f, 0.5f, 0.5f} ;
-__CCM_RAM_DATA float Ki_Position[Hall_Num] = {0.00f, 0.03f, 0.03f, 0.03f} ;  // 小积分消除静差, 克服摩擦力
-__CCM_RAM_DATA float Kd_Position[Hall_Num] = {0.01f, 0.0f, 0.0f, 0.0f} ;
+__CCM_RAM_DATA float Kp_Position[Hall_Num]  = {1.5f, 0.5f, 0.5f, 0.5f} ;
+__CCM_RAM_DATA float Ki_Position[Hall_Num] = {0.03f, 0.03f, 0.03f, 0.03f} ;  // 小积分消除静差, 克服摩擦力
+__CCM_RAM_DATA float Kd_Position[Hall_Num] = {0.1f, 0.0f, 0.0f, 0.0f} ;
 
 __CCM_RAM_DATA float Kp_Angle[Motor_Num] = {0.5f, 0.7f, 0.7f, 0.7f} ;
 __CCM_RAM_DATA float Ki_Angle[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
@@ -150,6 +157,21 @@ void Motor_Init(void)
     Reg[PID_REG_KP_SPD] = (uint16_t)(Kp_Speed[0] * 100.0f);
     Reg[PID_REG_KI_SPD] = (uint16_t)(Ki_Speed[0] * 100.0f);
     Reg[PID_REG_KD_SPD] = (uint16_t)(Kd_Speed[0] * 100.0f);
+
+    // 导纳控制参数默认值 (非对称: 接触省力, 松手快回弹)
+    // 缩放改为 ×0.001, 获得更精细的低刚度范围
+    // Reg[ADM_REG_K] = 接触刚度 ×1000
+    // Reg[ADM_REG_B] = 回弹刚度 ×1000 (1000=1.0 N/圈)
+    Reg[ADM_REG_K]    = 0x0020; // K_contact = 0.032
+    Reg[ADM_REG_B]    = 1000; // K_return  = 1.000
+    Reg[ADM_REG_DAMP] = 0x0010; // B_damp = 0.016
+
+    // 初始化导纳控制器 (M=0 一阶模型, x_max=50 圈)
+    Admittance_Init(&adm_ctrl, 0.0f, 0.016f, 0.032f, 70.0f);
+
+    // 初始化触觉传感器 (SPI 引脚和句柄请根据 CubeMX 配置修改)
+    Tactile_Init(&finger0_sensor, &hspi3, GPIOA, GPIO_PIN_12, "Finger0");
+    Tactile_RegisterSensor(&finger0_sensor);
 }
 
 /**
@@ -235,8 +257,8 @@ void Motor_Control_Loop(void)
             motor[i].CurrentSpeed = (float)delta * SPEED_CONV_FACTOR;
             motor[i].CurrentPosition = (float)ADC_HallValue[i];
 
-            /* ---- 堵转保护 ---- */
-            if (io_flag && mode != 4) {
+            /* ---- 堵转保护 (仅 Mode 1/3 角度环有效, Mode 5/6 跳过) ---- */
+            if (io_flag && (mode == 1 || mode == 3)) {
                 // 目标变化 → 重置计时
                 if (motor[i].TargetAngle != stall_target[i]) {
                     stall_target[i] = motor[i].TargetAngle;
@@ -285,10 +307,23 @@ void Motor_Control_Loop(void)
                     motor[i].CurrentSpeed = 0.0f;
                     motor[i].TargetSpeed = 0.0f;
                     break;
-                case 5: // 模式5：关节角度插值控制 (接收 Reg[i] 为目标关节物理角度)
+                case 5: // 模式5：关节角度插值控制 (Reg[i] 使用四位压缩BCD角度)
                 {
-                    float target_joint_angle = (float)Reg[i];
-                    if (target_joint_angle < 5.0f) target_joint_angle = 5.0f;   // 范围限制 5~90度
+                    uint16_t target_tenths = 0U;
+                    if (!AngleCodec_DecodeBcdTenths(Reg[i], &target_tenths)) {
+                        motor[i].TargetSpeed = 0.0f;
+                        PID_Position[i].Out_Last = 0.0f;
+                        PID_Position[i].Error_Last1 = 0.0f;
+                        PID_Position[i].Error_Last2 = 0.0f;
+                        PID_Speed[i].Out_Last = 0.0f;
+                        PID_Speed[i].Error_Last1 = 0.0f;
+                        PID_Speed[i].Error_Last2 = 0.0f;
+                        Set_Motor(i, 0, 0); // 非法BCD立即停止，跳过本周期速度环
+                        continue;
+                    }
+
+                    float target_joint_angle = (float)target_tenths * 0.1f;
+                    if (target_joint_angle < 5.0f) target_joint_angle = 5.0f;
                     if (target_joint_angle > 90.0f) target_joint_angle = 90.0f;
 
                     // 通过线性插值将目标物理角度转换为目标 ADC 值
@@ -305,6 +340,140 @@ void Motor_Control_Loop(void)
                     }
                     // 安全保护：若电机转动超过 40 圈则强制停止以防拉断
                     if (motor[i].CurrentAngle < -60.0f * Real_OneTurn || motor[i].CurrentAngle > 60.0f * Real_OneTurn) motor[i].TargetSpeed = 0.0f;
+                    break;
+                }
+                case 6: // 模式6: 导纳控制 (食指触觉传感器 → motor[0])
+                {
+                    // 仅食指 (motor 0) 使用导纳控制, 其他电机保持位置
+                    if (i == 0) {
+                        Tactile_Update(&finger0_sensor);
+                        float force = finger0_sensor.f_sum;
+
+                        // 力安全限: > 15N 自动退出导纳, 回角度控制 (0圈)
+                        if (force > 15.0f) {
+                            Reg[4] = 0x0101;   // mode=1, enable
+                            Reg[0] = 0x0064;   // 0 圈, 100% 速度
+                            Admittance_Reset(&adm_ctrl);
+                        }
+
+                        // 基角 (圈数) 从 Reg[0] 高 8 位读出
+                        float base_turns = (float)(Reg[0] >> 8);
+                        // 非对称刚度: 接触时用小 K (省力), 松手时用大 K (快回弹)
+                        adm_ctrl.B = (float)Reg[ADM_REG_DAMP] * 0.001f;
+                        adm_ctrl.K = (force > 0.1f)
+                            ? (float)Reg[ADM_REG_K] * 0.001f    // K_contact
+                            : (float)Reg[ADM_REG_B] * 0.001f;   // K_return
+                        // 导纳输出 = 退让圈数, 叠加到基角
+                        float delta_turns = Admittance_Update(&adm_ctrl, force, 0.01f);
+                        motor[0].TargetAngle = Real_OneTurn * (base_turns - delta_turns);
+                        // 软限位: 防止导纳退让超过 ±40 圈
+                        if (motor[0].TargetAngle >  Real_OneTurn * 40.0f)
+                            motor[0].TargetAngle =  Real_OneTurn * 40.0f;
+                        if (motor[0].TargetAngle < -Real_OneTurn * 40.0f)
+                            motor[0].TargetAngle = -Real_OneTurn * 40.0f;
+                    }
+                    // 全电机角度闭环
+                    motor[i].TargetSpeed = PID_Increment(&PID_Angle[i],
+                        motor[i].CurrentAngle, motor[i].TargetAngle);
+                    float max_spd = Real_MaxSpeed * (float)(Reg[i] & 0xFF);
+                    if (motor[i].TargetSpeed > max_spd)  motor[i].TargetSpeed = max_spd;
+                    else if (motor[i].TargetSpeed < -max_spd) motor[i].TargetSpeed = -max_spd;
+                    break;
+                }
+                case 7: // 模式7: 关节角度导纳控制 (触觉传感器 → 位置环 ADC 反馈)
+                {
+                    // 仅食指 (motor 0) 使用导纳控制, 其他电机走 Mode5 位置环
+                    if (i == 0) {
+                        uint16_t base_tenths = 0U;
+                        if (!AngleCodec_DecodeBcdTenths(Reg[0], &base_tenths)) {
+                            motor[0].TargetSpeed = 0.0f;
+                            PID_Position[0].Out_Last = 0.0f;
+                            PID_Position[0].Error_Last1 = 0.0f;
+                            PID_Position[0].Error_Last2 = 0.0f;
+                            PID_Speed[0].Out_Last = 0.0f;
+                            PID_Speed[0].Error_Last1 = 0.0f;
+                            PID_Speed[0].Error_Last2 = 0.0f;
+                            Set_Motor(0, 0, 0); // 非法BCD立即停止，跳过本周期速度环
+                            continue;
+                        }
+
+                        Tactile_Update(&finger0_sensor);
+                        float force = finger0_sensor.f_sum;
+
+                        // 力安全限: > 15N 自动退出导纳, 退回 Mode 5
+                        if (force > 15.0f) {
+                            Reg[4] = 0x0501;   // mode=5, enable
+                            Reg[0] = 0x0050;    // BCD编码的5.0°安全位置
+                            Admittance_Reset(&adm_ctrl);
+                            motor[0].TargetSpeed = 0.0f;
+                            PID_Position[0].Out_Last = 0.0f;
+                            PID_Position[0].Error_Last1 = 0.0f;
+                            PID_Position[0].Error_Last2 = 0.0f;
+                            PID_Speed[0].Out_Last = 0.0f;
+                            PID_Speed[0].Error_Last1 = 0.0f;
+                            PID_Speed[0].Error_Last2 = 0.0f;
+                            Set_Motor(0, 0, 0); // 当前周期先停止，下一周期由模式5移动到安全角度
+                            mode = 5U;           // 后续电机在当前周期立即按模式5处理
+                            continue;
+                        }
+
+                        // 基角由四位压缩BCD解码，范围5.0°~90.0°
+                        float base_angle = (float)base_tenths * 0.1f;
+                        if (base_angle < 5.0f)  base_angle = 5.0f;
+                        if (base_angle > 90.0f) base_angle = 90.0f;
+
+                        // 导纳参数: x_max 适配关节角度范围 (最大退让 40°)
+                        adm_ctrl.x_max = 40.0f;
+                        // 非对称刚度: 接触时用小 K (省力), 松手时用大 K (快回弹)
+                        adm_ctrl.B = (float)Reg[ADM_REG_DAMP] * 0.001f;
+                        adm_ctrl.K = (force > 0.1f)
+                            ? (float)Reg[ADM_REG_K] * 0.001f    // K_contact
+                            : (float)Reg[ADM_REG_B] * 0.001f;   // K_return
+
+                        // 导纳输出 = 角度退让量 (度), 从基角减去
+                        float delta_deg = Admittance_Update(&adm_ctrl, force, 0.01f);
+                        float target_angle = base_angle - delta_deg;
+                        if (target_angle < 5.0f)  target_angle = 5.0f;
+                        if (target_angle > 90.0f) target_angle = 90.0f;
+
+                        // 转换为 ADC 目标值 → 位置环
+                        motor[0].TargetPosition = lineInterp(JointAngle[0], ADValue[0],
+                            CalibrationLEN, target_angle, InterpolationFlag[0]);
+                    } else {
+                        // 其他电机使用模式5逻辑，从四位压缩BCD读取目标角度
+                        uint16_t target_tenths = 0U;
+                        if (!AngleCodec_DecodeBcdTenths(Reg[i], &target_tenths)) {
+                            motor[i].TargetSpeed = 0.0f;
+                            PID_Position[i].Out_Last = 0.0f;
+                            PID_Position[i].Error_Last1 = 0.0f;
+                            PID_Position[i].Error_Last2 = 0.0f;
+                            PID_Speed[i].Out_Last = 0.0f;
+                            PID_Speed[i].Error_Last1 = 0.0f;
+                            PID_Speed[i].Error_Last2 = 0.0f;
+                            Set_Motor(i, 0, 0); // 非法BCD立即停止，跳过本周期速度环
+                            continue;
+                        }
+
+                        float target_angle = (float)target_tenths * 0.1f;
+                        if (target_angle < 5.0f)  target_angle = 5.0f;
+                        if (target_angle > 90.0f) target_angle = 90.0f;
+                        motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i],
+                            CalibrationLEN, target_angle, InterpolationFlag[i]);
+                    }
+                    // 全电机位置环闭环 (ADC 反馈)
+                    motor[i].TargetSpeed = PID_Increment(&PID_Position[i],
+                        motor[i].CurrentPosition, motor[i].TargetPosition);
+
+                    // 死区处理: ADC 误差 ≤5 则停止
+                    if (PID_Position[i].Error_Last1 <= 5.0f && PID_Position[i].Error_Last1 >= -5.0f) {
+                        motor[i].TargetSpeed = 0.0f;
+                        PID_Position[i].Out_Last = 0.0f;
+                        PID_Position[i].Error_Last1 = 0.0f;
+                        PID_Position[i].Error_Last2 = 0.0f;
+                    }
+                    // 安全保护: 编码器超 60 圈则停止
+                    if (motor[i].CurrentAngle < -60.0f * Real_OneTurn || motor[i].CurrentAngle > 60.0f * Real_OneTurn)
+                        motor[i].TargetSpeed = 0.0f;
                     break;
                 }
                 default:
@@ -449,7 +618,20 @@ void Print_Motor_Status(uint8_t motor_index, uint8_t param)
         printf("Motor %d Target Speed: %.2f RPM, Actual Speed: %.2f RPM\r\n", motor_index + 1, motor[motor_index].TargetSpeed, motor[motor_index].CurrentSpeed);
     } else if (param == 2) {// 打印角度信息
         printf("Motor %d Target Angle: %.2f deg, Actual Angle: %.2f deg\r\n", motor_index + 1, motor[motor_index].TargetAngle , motor[motor_index].CurrentAngle);
-    }else if(param == 3){//打印目标位置和当前ADC值
-        printf("Motor %d Target Position: %.2f, Actual Position: %.2f\r\n", motor_index + 1, motor[motor_index].TargetPosition , motor[motor_index].CurrentPosition);
+    }else if(param == 3){//打印当前关节角度 (0-90°), 由 ADC 值通过标定表换算
+        float adc_current = motor[motor_index].CurrentPosition;
+        float adc_0  = ADValue[motor_index][0];  // 0° 对应 ADC
+        float adc_90 = ADValue[motor_index][1];  // 90° 对应 ADC
+        float angle_current = (adc_current - adc_0) / (adc_90 - adc_0) * 90.0f;
+        printf("Motor %d Actual: %.1f deg\r\n",
+               motor_index + 1, angle_current);
+    } else if (param == 4) {// 打印触觉传感器三维力
+        if (motor_index == 0 ) {
+            printf("[Finger0] Fx:%.1fN Fy:%.1fN Fz:%.1fN |F|=%.1fN\r\n",
+                finger0_sensor.fx, finger0_sensor.fy,
+                finger0_sensor.fz, finger0_sensor.f_sum);
+        } else {
+            printf("[Finger0] sensor error or no data\r\n");
+        }
     }
 }//用于调试，定期打印电机状态信息，观察 PID 收敛情况和系统响应特性

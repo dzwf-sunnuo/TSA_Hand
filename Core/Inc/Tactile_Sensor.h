@@ -50,14 +50,9 @@ HAL_StatusTypeDef Tactile_Init(Tactile_Sensor_t *sensor, SPI_HandleTypeDef *hspi
 HAL_StatusTypeDef Tactile_Update(Tactile_Sensor_t *sensor);
 
 /**
- * @brief 注册传感器到管理器，以便进行基于任务的自动更新
+ * @brief 注册传感器到管理器
  * @param sensor 传感器句柄指针
  */
 void Tactile_RegisterSensor(Tactile_Sensor_t *sensor);
-
-/**
- * @brief 启动触觉传感器管理的 FreeRTOS 任务
- */
-void Tactile_StartManager(void);
 
 #endif /* INC_TACTILE_SENSOR_H_ */
