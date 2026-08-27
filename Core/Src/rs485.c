@@ -9,6 +9,19 @@
 MODBUS modbus;
 uint16_t Reg[100] __attribute__((section(".ccmram"))) = {0};
 volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[5..13] 时置 1
+volatile uint8_t admittance_mode_restart = 0; // bit0=模式6，bit1=模式7
+
+// UpdateAdmittanceRestartFlag：检测模式寄存器写入并生成导纳重新启动事件
+// 参数：reg_value - 本次写入Reg[4]的完整16位值
+// 返回值：无
+static void UpdateAdmittanceRestartFlag(uint16_t reg_value)
+{
+    if (reg_value == 0x0601U) {
+        admittance_mode_restart |= 0x01U;
+    } else if (reg_value == 0x0701U) {
+        admittance_mode_restart |= 0x02U;
+    }
+}
 
 // LED 闪烁状态 (RS485 收发时双闪)
 static int led_blink_cnt = 0;  // 剩余闪烁次数 (0=空闲)
@@ -247,6 +260,7 @@ void Modbus_Func6(const uint8_t *buffer, uint16_t length)
 
     Reg[Regadd] = val;
     if (Regadd >= PID_REG_KP_POS && Regadd <= PID_REG_KD_SPD) pid_params_dirty = 1;
+    if (Regadd == 4U) UpdateAdmittanceRestartFlag(val);
 
     modbus.sendbuf[send_len++] = modbus.myadd;
     modbus.sendbuf[send_len++] = 0x06;
@@ -288,6 +302,8 @@ void Modbus_Func16(const uint8_t *buffer, uint16_t length)
     {
         Reg[Regadd + i] = (uint16_t)(buffer[7 + i * 2] * 256U + buffer[8 + i * 2]);
     }
+    if (Regadd <= 4U && (Regadd + Reglen) > 4U)
+        UpdateAdmittanceRestartFlag(Reg[4]);
     // 如果本次写入的寄存器区间与 PID 参数区间 [5,13] 有重叠, 打上脏标记
     if (Regadd <= PID_REG_KD_SPD && (Regadd + Reglen) > PID_REG_KP_POS)
         pid_params_dirty = 1;
