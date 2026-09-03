@@ -187,14 +187,17 @@ ctest --test-dir build/host-tests --output-on-failure
 
 ```bash
 pip install pyserial matplotlib numpy
-python tools/plot_motor_reduction_ratio.py COM9 115200 --motor 1
+python tools/plot_motor_reduction_ratio.py COM8 115200 --motor 1 --degree 3
 ```
 
-按`Ctrl+C`或关闭图表窗口停止采集。脚本会在`logs/`目录保存原始CSV和PNG图表，并按照相对首个采样点的变化量计算：
+默认串口为`COM8`，默认采用三次多项式，可通过`--degree 1～5`选择其他阶数。按`Ctrl+C`或关闭图表窗口停止采集，脚本会在`logs/`目录保存原始CSV、PNG图表和拟合结果TXT。
 
 ```text
-减速比 = Δ电机圈数 / (Δ关节角度 / 360°)
+电机圈数变化 = aₙxⁿ + ... + a₁x + a₀
+局部减速比(x) = 360 × |d(电机圈数变化)/dx|
 ```
+
+其中`x`为相对首个采样点的关节角度变化。拟合结果包含完整多项式系数、决定系数`R²`、有效角度范围和末点局部减速比。
 
 ## 推荐上位机操作顺序
 
