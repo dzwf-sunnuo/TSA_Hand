@@ -14,6 +14,9 @@ volatile uint8_t experiment_event = 0; // 1=实验开始，2=实验停止
 volatile uint8_t experiment_mode = 0;
 volatile uint8_t experiment_output_limit = 0;
 
+#define EXPERIMENT_TARGET_TURNS 60U
+#define EXPERIMENT_RETURN_COMMAND 0x0064U
+
 // UpdateAdmittanceRestartFlag：检测模式寄存器写入并生成导纳重新启动事件
 // 参数：reg_value - 本次写入Reg[4]的完整16位值
 // 返回值：无
@@ -26,17 +29,34 @@ static void UpdateAdmittanceRestartFlag(uint16_t reg_value)
     }
 }
 
-// UpdateExperimentEvent：根据模式寄存器写入生成减速比实验事件
-// 参数：reg_value - 本次写入Reg[4]的完整16位值
-// 返回值：无
-static void UpdateExperimentEvent(uint16_t reg_value)
+// IsExperimentOutputLimit：判断输出限幅是否属于五档减速比实验
+// 参数：output_limit - Reg[0]低字节中的输出限幅百分比
+// 返回值：uint8_t - 属于20、40、60、80、100时返回1，否则返回0
+static uint8_t IsExperimentOutputLimit(uint8_t output_limit)
 {
-    uint8_t mode = (uint8_t)(reg_value >> 8);
-    uint8_t enable = (uint8_t)(reg_value & 0xFFU);
+    return (uint8_t)(output_limit == 20U || output_limit == 40U ||
+                     output_limit == 60U || output_limit == 80U ||
+                     output_limit == 100U);
+}
 
-    if ((mode == 1U || mode == 3U) && enable != 0U) {
+// UpdateExperimentEvent：根据当前电机0目标和模式生成减速比实验事件
+// 参数：无
+// 返回值：无
+static void UpdateExperimentEvent(void)
+{
+    uint8_t mode = (uint8_t)(Reg[4] >> 8);
+    uint8_t enable = (uint8_t)(Reg[4] & 0xFFU);
+    uint8_t target_turns = (uint8_t)(Reg[0] >> 8);
+    uint8_t output_limit = (uint8_t)(Reg[0] & 0xFFU);
+
+    if ((mode == 1U || mode == 3U) && enable != 0U &&
+        Reg[0] == EXPERIMENT_RETURN_COMMAND) {
+        experiment_event = 2U;
+    } else if ((mode == 1U || mode == 3U) && enable != 0U &&
+               target_turns == EXPERIMENT_TARGET_TURNS &&
+               IsExperimentOutputLimit(output_limit) != 0U) {
         experiment_mode = mode;
-        experiment_output_limit = (uint8_t)(Reg[0] & 0xFFU);
+        experiment_output_limit = output_limit;
         experiment_event = 1U;
     } else if (mode == 4U || enable == 0U) {
         experiment_event = 2U;
@@ -282,8 +302,8 @@ void Modbus_Func6(const uint8_t *buffer, uint16_t length)
     if (Regadd >= PID_REG_KP_POS && Regadd <= PID_REG_KD_SPD) pid_params_dirty = 1;
     if (Regadd == 4U) {
         UpdateAdmittanceRestartFlag(val);
-        UpdateExperimentEvent(val);
     }
+    if (Regadd == 0U || Regadd == 4U) UpdateExperimentEvent();
 
     modbus.sendbuf[send_len++] = modbus.myadd;
     modbus.sendbuf[send_len++] = 0x06;
@@ -327,8 +347,9 @@ void Modbus_Func16(const uint8_t *buffer, uint16_t length)
     }
     if (Regadd <= 4U && (Regadd + Reglen) > 4U) {
         UpdateAdmittanceRestartFlag(Reg[4]);
-        UpdateExperimentEvent(Reg[4]);
     }
+    if (Regadd == 0U || (Regadd <= 4U && (Regadd + Reglen) > 4U))
+        UpdateExperimentEvent();
     // 如果本次写入的寄存器区间与 PID 参数区间 [5,13] 有重叠, 打上脏标记
     if (Regadd <= PID_REG_KD_SPD && (Regadd + Reglen) > PID_REG_KP_POS)
         pid_params_dirty = 1;

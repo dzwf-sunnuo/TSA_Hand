@@ -232,6 +232,36 @@ def plot_comparison(figure_path: Path, runs, degree: int) -> None:
     plt.close(figure)
 
 
+# plot_ratio_curves：把五档输出限幅的局部减速比曲线绘制在同一张图中
+# 参数：figure_path - PNG路径；runs - 有效实验段
+# 返回值：无
+def plot_ratio_curves(figure_path: Path, runs) -> None:
+    figure, axis = plt.subplots(figsize=(11, 7))
+
+    for run in runs:
+        fit_result = run["fit"]
+        angle_values = np.linspace(
+            fit_result["angle_min"], fit_result["angle_max"], 400
+        )
+        derivative = np.polyder(fit_result["coefficients"])
+        ratio_values = np.abs(np.polyval(derivative, angle_values)) * 360.0
+        axis.plot(
+            angle_values,
+            ratio_values,
+            linewidth=2,
+            label=f"{run['limit']}% run{run['run_id']}",
+        )
+
+    axis.set_title("Reduction-ratio curves at different output limits")
+    axis.set_xlabel("Joint angle change (deg)")
+    axis.set_ylabel("Local reduction ratio")
+    axis.grid(True, alpha=0.3)
+    axis.legend(title="Output limit")
+    figure.tight_layout()
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+
+
 # main：等待固件标志、分段记录数据并生成多速度对比结果
 # 参数：无
 # 返回值：无
@@ -244,6 +274,7 @@ def main() -> None:
     summary_path = output_dir / f"多速度减速比汇总_{timestamp}.csv"
     report_path = output_dir / f"多速度减速比报告_{timestamp}.txt"
     figure_path = output_dir / f"多速度减速比对比_{timestamp}.png"
+    ratio_figure_path = output_dir / f"五档速度减速比曲线_{timestamp}.png"
 
     try:
         serial_port = serial.Serial(args.port, args.baud, timeout=1.0)
@@ -255,6 +286,7 @@ def main() -> None:
     current_run = None
     next_run_id = 1
     allowed_limits = set(args.limits)
+    completed_limits = set()
 
     print(f"等待实验标志：{args.port} @ {args.baud}")
     print(f"记录限幅：{', '.join(str(value) + '%' for value in args.limits)}")
@@ -280,7 +312,12 @@ def main() -> None:
                     if event_name == "stop":
                         if current_run is not None:
                             print(f"实验{current_run['run_id']}停止，共{len(current_run['turns'])}点")
+                            if current_run["turns"]:
+                                completed_limits.add(current_run["limit"])
                         current_run = None
+                        if allowed_limits.issubset(completed_limits):
+                            print("五档输出限幅均已完成，自动结束采集")
+                            break
                     elif motor == args.motor and limit in allowed_limits:
                         current_run = start_run(next_run_id, motor, limit, mode)
                         runs.append(current_run)
@@ -330,10 +367,12 @@ def main() -> None:
     save_summary(summary_path, analyzed_runs, args.degree)
     save_report(report_path, analyzed_runs, args.degree)
     plot_comparison(figure_path, analyzed_runs, args.degree)
+    plot_ratio_curves(ratio_figure_path, analyzed_runs)
     print(f"原始数据：{raw_path}")
     print(f"指标汇总：{summary_path}")
     print(f"分析报告：{report_path}")
     print(f"对比图表：{figure_path}")
+    print(f"五档减速比曲线：{ratio_figure_path}")
 
 
 if __name__ == "__main__":
