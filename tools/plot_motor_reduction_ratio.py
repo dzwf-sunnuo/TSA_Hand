@@ -72,6 +72,7 @@ def fit_polynomial(motor_turns, joint_angles, degree):
     residual_sum = float(np.sum((delta_turns - fitted_turns) ** 2))
     total_sum = float(np.sum((delta_turns - np.mean(delta_turns)) ** 2))
     r_squared = 1.0 - residual_sum / total_sum if total_sum > 0.0 else 1.0
+    polynomial_rmse = float(np.sqrt(np.mean((delta_turns - fitted_turns) ** 2)))
 
     derivative = np.polyder(coefficients)
     current_angle = float(delta_angles[-1])
@@ -83,6 +84,37 @@ def fit_polynomial(motor_turns, joint_angles, degree):
         "angle_max": float(delta_angles.max()),
         "current_angle": current_angle,
         "local_ratio": local_ratio,
+        "polynomial_rmse": polynomial_rmse,
+        "linearity": analyze_linearity(delta_turns, delta_angles),
+    }
+
+
+# analyze_linearity：按照最佳拟合直线计算满量程线性度
+# 参数：delta_turns - 相对电机圈数；delta_angles - 相对关节角度
+# 返回值：dict - 直线系数、残差、R²、RMSE和满量程线性度
+def analyze_linearity(delta_turns, delta_angles):
+    coefficients = np.polyfit(delta_angles, delta_turns, 1)
+    fitted_turns = np.polyval(coefficients, delta_angles)
+    residuals = delta_turns - fitted_turns
+    residual_sum = float(np.sum(residuals ** 2))
+    total_sum = float(np.sum((delta_turns - np.mean(delta_turns)) ** 2))
+    r_squared = 1.0 - residual_sum / total_sum if total_sum > 0.0 else 1.0
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    max_deviation = float(np.max(np.abs(residuals)))
+    full_scale = float(np.ptp(delta_turns))
+    linearity_percent_fs = (
+        max_deviation / full_scale * 100.0 if full_scale > 0.0 else None
+    )
+
+    return {
+        "coefficients": coefficients,
+        "fitted_turns": fitted_turns,
+        "residuals": residuals,
+        "r_squared": r_squared,
+        "rmse": rmse,
+        "max_deviation": max_deviation,
+        "full_scale": full_scale,
+        "linearity_percent_fs": linearity_percent_fs,
     }
 
 
@@ -108,13 +140,15 @@ def format_polynomial(coefficients) -> str:
 # 返回值：tuple - 图形、坐标轴和曲线对象
 def configure_plot(motor_number: int, degree: int):
     plt.ion()
-    figure, (axis_time, axis_relation) = plt.subplots(2, 1, figsize=(10, 8))
+    figure, (axis_time, axis_relation, axis_residual) = plt.subplots(3, 1, figsize=(10, 10))
     axis_angle = axis_time.twinx()
 
     turns_line, = axis_time.plot([], [], color="tab:blue", label="Motor turns")
     angle_line, = axis_angle.plot([], [], color="tab:orange", label="Joint angle")
     relation_points, = axis_relation.plot([], [], "o", markersize=3, color="tab:green", label="Samples")
     fit_line, = axis_relation.plot([], [], "-", color="tab:red", label=f"Degree {degree} fit")
+    linear_line, = axis_relation.plot([], [], "--", color="tab:purple", label="Best-fit line")
+    residual_points, = axis_residual.plot([], [], "o", markersize=3, color="tab:brown")
 
     axis_time.set_xlabel("Time (s)")
     axis_time.set_ylabel("Motor turns", color="tab:blue")
@@ -126,17 +160,29 @@ def configure_plot(motor_number: int, degree: int):
     axis_relation.set_ylabel("Motor turn change")
     axis_relation.grid(True, alpha=0.3)
     axis_relation.legend(loc="upper left")
+    axis_residual.axhline(0.0, color="black", linewidth=1, alpha=0.5)
+    axis_residual.set_xlabel("Joint angle change (deg)")
+    axis_residual.set_ylabel("Linear residual (turns)")
+    axis_residual.grid(True, alpha=0.3)
     figure.suptitle(f"Motor {motor_number} nonlinear transmission experiment")
     figure.tight_layout()
 
-    return figure, axis_time, axis_angle, axis_relation, turns_line, angle_line, relation_points, fit_line
+    return (
+        figure, axis_time, axis_angle, axis_relation, axis_residual,
+        turns_line, angle_line, relation_points, fit_line, linear_line,
+        residual_points,
+    )
 
 
 # update_plot：使用最新数据刷新实时图表和多项式拟合结果
 # 参数：plot_items - 绘图对象；times、motor_turns、joint_angles - 采样数据；degree - 多项式阶数
 # 返回值：dict或None - 当前多项式拟合结果
 def update_plot(plot_items, times, motor_turns, joint_angles, degree):
-    figure, axis_time, axis_angle, axis_relation, turns_line, angle_line, relation_points, fit_line = plot_items
+    (
+        figure, axis_time, axis_angle, axis_relation, axis_residual,
+        turns_line, angle_line, relation_points, fit_line, linear_line,
+        residual_points,
+    ) = plot_items
     turns_line.set_data(times, motor_turns)
     angle_line.set_data(times, joint_angles)
     axis_time.relim()
@@ -155,13 +201,30 @@ def update_plot(plot_items, times, motor_turns, joint_angles, degree):
         fit_x = np.linspace(delta_angles.min(), delta_angles.max(), 300)
         fit_y = np.polyval(fit_result["coefficients"], fit_x)
         fit_line.set_data(fit_x, fit_y)
+        linearity = fit_result["linearity"]
+        linear_y = np.polyval(linearity["coefficients"], fit_x)
+        linear_line.set_data(fit_x, linear_y)
+        residual_points.set_data(delta_angles, linearity["residuals"])
+        axis_residual.relim()
+        axis_residual.autoscale_view()
+        linearity_text = (
+            "N/A"
+            if linearity["linearity_percent_fs"] is None
+            else f"{linearity['linearity_percent_fs']:.3f}%FS"
+        )
         axis_relation.set_title(
             f"Degree {degree} fit, R²={fit_result['r_squared']:.5f}, "
             f"local ratio={fit_result['local_ratio']:.2f}:1"
         )
+        axis_residual.set_title(
+            f"BFSL linearity={linearity_text}, linear R²={linearity['r_squared']:.5f}"
+        )
     else:
         fit_line.set_data([], [])
+        linear_line.set_data([], [])
+        residual_points.set_data([], [])
         axis_relation.set_title(f"Need {degree + 1} samples and at least 1 degree of motion")
+        axis_residual.set_title("Waiting for valid linearity data")
 
     figure.canvas.draw_idle()
     figure.canvas.flush_events()
@@ -185,11 +248,33 @@ def save_fit_result(result_path: Path, motor_number: int, degree: int, fit_resul
         result_file.write("定义: y=相对首个采样点的电机圈数变化(圈)\n")
         result_file.write(f"拟合公式: y = {formula}\n")
         result_file.write(f"R²: {fit_result['r_squared']:.8f}\n")
+        result_file.write(f"多项式拟合RMSE: {fit_result['polynomial_rmse']:.8f} 圈\n")
         result_file.write(
             f"有效角度范围: {fit_result['angle_min']:.4f} 至 "
             f"{fit_result['angle_max']:.4f} 度\n"
         )
         result_file.write(f"末点局部减速比: {fit_result['local_ratio']:.4f}:1\n")
+
+        linearity = fit_result["linearity"]
+        linear_formula = format_polynomial(linearity["coefficients"])
+        result_file.write("\n线性度分析（最佳拟合直线BFSL）\n")
+        result_file.write(f"最佳拟合直线: y = {linear_formula}\n")
+        result_file.write(f"线性拟合R²: {linearity['r_squared']:.8f}\n")
+        result_file.write(f"线性拟合RMSE: {linearity['rmse']:.8f} 圈\n")
+        result_file.write(f"最大绝对线性偏差: {linearity['max_deviation']:.8f} 圈\n")
+        result_file.write(f"电机圈数满量程变化: {linearity['full_scale']:.8f} 圈\n")
+        if linearity["linearity_percent_fs"] is None:
+            result_file.write("满量程线性度误差: 无法计算（输出跨度为零）\n")
+        else:
+            result_file.write(
+                f"满量程线性度误差: {linearity['linearity_percent_fs']:.6f}%FS\n"
+            )
+
+        if linearity["rmse"] > 0.0:
+            improvement = (
+                1.0 - fit_result["polynomial_rmse"] / linearity["rmse"]
+            ) * 100.0
+            result_file.write(f"多项式相对直线RMSE改善: {improvement:.4f}%\n")
 
 
 # main：打开串口、记录CSV、实时拟合并保存图表和结果
@@ -269,6 +354,11 @@ def main() -> None:
             print(f"拟合公式：y = {formula}")
             print(f"R^2：{latest_fit['r_squared']:.6f}")
             print(f"末点局部减速比：{latest_fit['local_ratio']:.2f}:1")
+            linearity = latest_fit["linearity"]
+            print(f"线性拟合R^2：{linearity['r_squared']:.6f}")
+            print(f"线性拟合RMSE：{linearity['rmse']:.6f}圈")
+            if linearity["linearity_percent_fs"] is not None:
+                print(f"满量程线性度误差：{linearity['linearity_percent_fs']:.4f}%FS")
 
 
 if __name__ == "__main__":
