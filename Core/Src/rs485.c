@@ -10,6 +10,9 @@ MODBUS modbus;
 uint16_t Reg[100] __attribute__((section(".ccmram"))) = {0};
 volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[5..13] 时置 1
 volatile uint8_t admittance_mode_restart = 0; // bit0=模式6，bit1=模式7
+volatile uint8_t experiment_event = 0; // 1=实验开始，2=实验停止
+volatile uint8_t experiment_mode = 0;
+volatile uint8_t experiment_output_limit = 0;
 
 // UpdateAdmittanceRestartFlag：检测模式寄存器写入并生成导纳重新启动事件
 // 参数：reg_value - 本次写入Reg[4]的完整16位值
@@ -20,6 +23,23 @@ static void UpdateAdmittanceRestartFlag(uint16_t reg_value)
         admittance_mode_restart |= 0x01U;
     } else if (reg_value == 0x0701U) {
         admittance_mode_restart |= 0x02U;
+    }
+}
+
+// UpdateExperimentEvent：根据模式寄存器写入生成减速比实验事件
+// 参数：reg_value - 本次写入Reg[4]的完整16位值
+// 返回值：无
+static void UpdateExperimentEvent(uint16_t reg_value)
+{
+    uint8_t mode = (uint8_t)(reg_value >> 8);
+    uint8_t enable = (uint8_t)(reg_value & 0xFFU);
+
+    if ((mode == 1U || mode == 3U) && enable != 0U) {
+        experiment_mode = mode;
+        experiment_output_limit = (uint8_t)(Reg[0] & 0xFFU);
+        experiment_event = 1U;
+    } else if (mode == 4U || enable == 0U) {
+        experiment_event = 2U;
     }
 }
 
@@ -260,7 +280,10 @@ void Modbus_Func6(const uint8_t *buffer, uint16_t length)
 
     Reg[Regadd] = val;
     if (Regadd >= PID_REG_KP_POS && Regadd <= PID_REG_KD_SPD) pid_params_dirty = 1;
-    if (Regadd == 4U) UpdateAdmittanceRestartFlag(val);
+    if (Regadd == 4U) {
+        UpdateAdmittanceRestartFlag(val);
+        UpdateExperimentEvent(val);
+    }
 
     modbus.sendbuf[send_len++] = modbus.myadd;
     modbus.sendbuf[send_len++] = 0x06;
@@ -302,8 +325,10 @@ void Modbus_Func16(const uint8_t *buffer, uint16_t length)
     {
         Reg[Regadd + i] = (uint16_t)(buffer[7 + i * 2] * 256U + buffer[8 + i * 2]);
     }
-    if (Regadd <= 4U && (Regadd + Reglen) > 4U)
+    if (Regadd <= 4U && (Regadd + Reglen) > 4U) {
         UpdateAdmittanceRestartFlag(Reg[4]);
+        UpdateExperimentEvent(Reg[4]);
+    }
     // 如果本次写入的寄存器区间与 PID 参数区间 [5,13] 有重叠, 打上脏标记
     if (Regadd <= PID_REG_KD_SPD && (Regadd + Reglen) > PID_REG_KP_POS)
         pid_params_dirty = 1;

@@ -208,6 +208,9 @@ void StartDefaultTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+extern volatile uint8_t experiment_event;
+extern volatile uint8_t experiment_mode;
+extern volatile uint8_t experiment_output_limit;
 /**
   * @brief 电机控制任务 (最高实时优先级)
   * @param argument: 未使用
@@ -349,6 +352,16 @@ void vSystemMonitorTask(void *argument)
       PL_Resume();         // 开 LED
       pl_was_lost = 0;
     }
+      // 先输出实验事件，再输出同周期数据，便于上位机准确切分采集区间
+      if (experiment_event == 1U) {
+        printf("EXPERIMENT_START,1,%u,%u\r\n",
+               (unsigned int)experiment_output_limit,
+               (unsigned int)experiment_mode);
+        experiment_event = 0U;
+      } else if (experiment_event == 2U) {
+        printf("EXPERIMENT_STOP\r\n");
+        experiment_event = 0U;
+      }
       Print_Motor_Status(0, 5); // 输出食指：电机编号,电机累计圈数,关节角度
     }
 
