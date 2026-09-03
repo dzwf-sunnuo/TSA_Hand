@@ -647,8 +647,9 @@ float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
     return out;
 }
 
-//打印特定电机的目标出轴角度，当前出轴角度，目标速度，当前速度
-//（两个参数，第一个参数是电机索引，0-3，第二个是要看的参数，1对应目标出轴速度和当前出轴速度，2对应目标出轴角度和当前出轴角度）
+// Print_Motor_Status：按指定格式输出电机、关节或触觉调试数据
+// 参数：motor_index - 电机索引，范围0～3；param - 输出类型，1～5
+// 返回值：无
 void Print_Motor_Status(uint8_t motor_index, uint8_t param)
 {
     if (motor_index >= Motor_Num) return;
@@ -672,5 +673,14 @@ void Print_Motor_Status(uint8_t motor_index, uint8_t param)
         } else {
             printf("Motor %d has no tactile sensor\r\n", motor_index + 1);
         }
+    } else if (param == 5) {// 输出减速比实验CSV：电机编号,电机累计圈数,关节角度
+        float motor_turns = motor[motor_index].CurrentAngle / Real_OneTurn;
+        float adc_current = motor[motor_index].CurrentPosition;
+        float adc_0 = ADValue[motor_index][0];
+        float adc_90 = ADValue[motor_index][1];
+        float joint_angle = (adc_current - adc_0) / (adc_90 - adc_0) * 90.0f;
+
+        printf("%u,%.4f,%.2f\r\n",
+               (unsigned int)(motor_index + 1U), motor_turns, joint_angle);
     }
 }//用于调试，定期打印电机状态信息，观察 PID 收敛情况和系统响应特性

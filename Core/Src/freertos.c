@@ -323,7 +323,7 @@ void vSensorProcessTask(void *argument)
   * @brief 系统监视及低频定时任务 (低优先级)
   * @param argument: 未使用
   * @retval None
-  * @note 用于处理 200ms 其他逻辑
+  * @note 用于处理100ms周期的状态监控和实验数据输出
   */
 void vSystemMonitorTask(void *argument)
 {
@@ -331,8 +331,8 @@ void vSystemMonitorTask(void *argument)
   int pl_was_lost = 0;  // 掉电恢复标志
   for(;;)
   {
-    // 100ms 周期监控
-    osDelayUntil(PreviousWakeTime + 500);
+    // 100ms周期监控，同时输出减速比实验CSV数据
+    osDelayUntil(PreviousWakeTime + 100);
     PreviousWakeTime = osKernelGetTickCount();
 
     // 12V 主电掉电检测 (ADC2 IN4, 100ms 轮询 + 2 次消抖 = 200ms)
@@ -349,8 +349,7 @@ void vSystemMonitorTask(void *argument)
       PL_Resume();         // 开 LED
       pl_was_lost = 0;
     }
-      //uint16_t hall0 = ADC_HallValue[0];  // 权威值: 先快照
-      Print_Motor_Status(0, 4);           // 打印 Target/Actual Position
+      Print_Motor_Status(0, 5); // 输出食指：电机编号,电机累计圈数,关节角度
     }
 
   }

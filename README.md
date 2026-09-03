@@ -174,6 +174,28 @@ cmake --build build/host-tests
 ctest --test-dir build/host-tests --output-on-failure
 ```
 
+## 电机与关节减速比实验
+
+系统监控任务默认每100 ms通过USART2输出一次食指数据，格式为：
+
+```text
+电机编号,电机累计圈数,关节角度
+1,12.3456,37.20
+```
+
+使用串口实时记录数据、绘制曲线并拟合减速比：
+
+```bash
+pip install pyserial matplotlib numpy
+python tools/plot_motor_reduction_ratio.py COM9 115200 --motor 1
+```
+
+按`Ctrl+C`或关闭图表窗口停止采集。脚本会在`logs/`目录保存原始CSV和PNG图表，并按照相对首个采样点的变化量计算：
+
+```text
+减速比 = Δ电机圈数 / (Δ关节角度 / 360°)
+```
+
 ## 推荐上位机操作顺序
 
 1. 确认串口参数和从机地址。
