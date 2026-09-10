@@ -23,6 +23,7 @@ POSITION_REGISTER_COUNT = 5
 POSITION_BYTE_COUNT = POSITION_REGISTER_COUNT * 2
 POSITION_SPEED = 2000
 POSITION_ACCELERATION_TIME = 250
+DEFAULT_FOLLOW_DEADBAND = 2.0
 EMERGENCY_STOP_ADDRESS = 0x0004
 STREAM_ANGLE_PATTERN = re.compile(r"^\d{1,2}\.\d{2}$")
 MODBUS_EXCEPTION_MESSAGES = {
@@ -33,7 +34,7 @@ MODBUS_EXCEPTION_MESSAGES = {
 
 
 # ConnectionSettings：保存两个串口和Modbus连接参数
-# 参数：driver_port - 驱动串口；angle_port - 可选角度串口；baudrate - 波特率；slave_address - 从站地址
+# 参数：driver_port - 驱动串口；angle_port - 可选角度串口；baudrate - 波特率；slave_address - 从站地址；deadband_degrees - 跟随死区角度
 # 返回值：ConnectionSettings - 不可变连接配置
 @dataclass(frozen=True)
 class ConnectionSettings:
@@ -41,6 +42,7 @@ class ConnectionSettings:
     angle_port: str | None
     baudrate: int
     slave_address: int
+    deadband_degrees: float = DEFAULT_FOLLOW_DEADBAND
 
 
 # ControllerCommand：描述界面发给后台线程的控制命令
@@ -400,6 +402,8 @@ class SerialController:
         self._settings: ConnectionSettings | None = None
         self._angle_port_name: str | None = None
         self._following = False
+        self._follow_deadband = DEFAULT_FOLLOW_DEADBAND
+        self._last_follow_sent_angle: float | None = None
 
     # SerialController.start：启动串口后台线程
     # 参数：无
@@ -463,6 +467,11 @@ class SerialController:
         if not isinstance(settings.baudrate, int) or settings.baudrate <= 0:
             raise ValueError("波特率必须是正整数")
         validate_slave_address(settings.slave_address)
+        if (
+            not math.isfinite(settings.deadband_degrees)
+            or not 0.0 <= settings.deadband_degrees <= 90.0
+        ):
+            raise ValueError("跟随死区必须位于0.00～90.00°")
         angle_port = settings.angle_port.strip() if settings.angle_port else None
         if require_angle and not angle_port:
             raise ValueError("开始跟随前必须选择角度串口")
@@ -492,6 +501,7 @@ class SerialController:
         self._close_port(self._driver_serial)
         self._driver_serial = None
         self._settings = None
+        self._last_follow_sent_angle = None
         if emit_status:
             self._emit(
                 "status",
@@ -580,6 +590,10 @@ class SerialController:
                 self._emit("error", f"角度串口打开失败：{error}")
                 return
 
+        # 每次开始跟随都重置基准，确保第一条有效角度必定发送。
+        self.target_buffer.clear(reset_last_sent=True)
+        self._follow_deadband = payload.deadband_degrees
+        self._last_follow_sent_angle = None
         self._following = True
         self._emit(
             "status",
@@ -605,6 +619,8 @@ class SerialController:
         except ValueError as error:
             self._emit("warning", str(error))
             return
+        # 手动调试每次点击都强制下发，不受跟随死区或重复目标抑制影响
+        self.target_buffer.clear(reset_last_sent=True)
         self.target_buffer.put(angle)
 
     # SerialController._exchange_position：发送位置命令，失败时最多重试一次
@@ -640,6 +656,9 @@ class SerialController:
                 self._emit("error", f"位置命令重试失败：{error}")
                 return
             self.target_buffer.mark_sent(target_step)
+            if self._following:
+                # 只有驱动器确认接收后才更新跟随死区基准。
+                self._last_follow_sent_angle = angle
             self._emit("rx", f"收到位置响应：{format_hex(response)}", response)
             return
 
@@ -649,6 +668,7 @@ class SerialController:
     def _emergency_stop(self) -> None:
         self._following = False
         self.target_buffer.clear()
+        self._last_follow_sent_angle = None
         if self._driver_serial is None or self._settings is None:
             self._emit("error", "驱动串口未连接，无法发送急停")
             return
@@ -686,6 +706,7 @@ class SerialController:
         elif command.kind == "stop_follow":
             self._following = False
             self.target_buffer.clear()
+            self._last_follow_sent_angle = None
             self._emit(
                 "status",
                 "串口跟随已停止",
@@ -728,12 +749,23 @@ class SerialController:
             self._emit("warning", f"忽略非法角度数据：{raw!r}", raw)
             return
         target_step = angle_to_step(angle)
-        self.target_buffer.put(angle)
         self._emit(
             "angle",
             f"角度{angle:.2f}°映射为{target_step}步",
             {"raw": raw, "angle": angle, "step": target_step},
         )
+        if (
+            self._last_follow_sent_angle is not None
+            and abs(angle - self._last_follow_sent_angle) <= self._follow_deadband
+        ):
+            difference = abs(angle - self._last_follow_sent_angle)
+            self._emit(
+                "deadband",
+                f"死区内忽略：变化{difference:.2f}°，死区{self._follow_deadband:.2f}°",
+                {"angle": angle, "difference": difference},
+            )
+            return
+        self.target_buffer.put(angle)
 
     # SerialController._read_angle_lines：读取已到达的角度行并只保留最新目标
     # 参数：无
@@ -843,6 +875,7 @@ class StepperControllerApp(tk.Tk):
         self.angle_port_var = tk.StringVar()
         self.baudrate_var = tk.StringVar(value="115200")
         self.slave_address_var = tk.StringVar(value="1")
+        self.deadband_var = tk.StringVar(value=f"{DEFAULT_FOLLOW_DEADBAND:.2f}")
         self.mode_var = tk.StringVar(value="manual")
         self.raw_data_var = tk.StringVar(value="--")
         self.valid_angle_var = tk.StringVar(value="--")
@@ -936,6 +969,11 @@ class StepperControllerApp(tk.Tk):
             command=self._on_mode_changed,
         )
         self.manual_mode_button.pack(side="left", padx=12)
+        ttk.Label(frame, text="跟随死区（°）").pack(side="left", padx=(28, 4))
+        self.deadband_entry = ttk.Entry(
+            frame, textvariable=self.deadband_var, width=8
+        )
+        self.deadband_entry.pack(side="left", padx=4)
 
     # StepperControllerApp._create_status_frame：创建原始输入和运行状态显示区域
     # 参数：parent - 父级容器
@@ -1112,11 +1150,20 @@ class StepperControllerApp(tk.Tk):
         except ValueError as error:
             raise ValueError("Modbus从站地址必须位于1～254") from error
         validate_slave_address(slave_address)
+        deadband_degrees = DEFAULT_FOLLOW_DEADBAND
+        if require_angle:
+            try:
+                deadband_degrees = float(self.deadband_var.get().strip())
+            except ValueError as error:
+                raise ValueError("跟随死区必须位于0.00～90.00°") from error
+            if not math.isfinite(deadband_degrees) or not 0.0 <= deadband_degrees <= 90.0:
+                raise ValueError("跟随死区必须位于0.00～90.00°")
         return ConnectionSettings(
             driver_port=driver_port,
             angle_port=angle_port if require_angle else None,
             baudrate=baudrate,
             slave_address=slave_address,
+            deadband_degrees=deadband_degrees,
         )
 
     # StepperControllerApp._show_input_error：记录并弹窗显示界面参数错误
@@ -1349,6 +1396,7 @@ class StepperControllerApp(tk.Tk):
         self.angle_port_combo.configure(state=angle_combo_state)
         self.baudrate_entry.configure(state=config_state)
         self.slave_address_entry.configure(state=config_state)
+        self.deadband_entry.configure(state="disabled" if self._following else "normal")
         self.refresh_button.configure(
             state="disabled" if self._following else "normal"
         )
