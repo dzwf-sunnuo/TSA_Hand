@@ -780,7 +780,7 @@ class SerialController:
                         timeout=0.001 if self._following else 0.02
                     )
                 except queue.Empty:
-                    pass
+                    first_command = None
                 self._drain_commands(first_command)
                 if self._stop_event.is_set():
                     break

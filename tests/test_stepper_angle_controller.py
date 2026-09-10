@@ -125,6 +125,23 @@ def test_crc_known_vector() -> None:
 
 
 @pytest.mark.parametrize(
+    "frame_hex",
+    [
+        "01 10 00 10 00 05 0A 00 00 01 F4 00 00 07 D0 00 FA E4 E5",
+        "01 10 00 10 00 05 0A 00 01 5F 90 00 00 07 D0 00 FA 48 03",
+        "01 10 00 10 00 05 01 CF",
+        "01 06 00 04 00 01 09 CB",
+    ],
+)
+# test_guide_frames_have_valid_crc：验证使用指南中四个标准报文的CRC
+# 参数：frame_hex - 指南中的完整十六进制报文
+# 返回值：无
+def test_guide_frames_have_valid_crc(frame_hex: str) -> None:
+    frame = bytes.fromhex(frame_hex)
+    assert calculate_modbus_crc(frame[:-2]) == frame[-2:]
+
+
+@pytest.mark.parametrize(
     ("target_step", "expected_hex"),
     [
         (500, "01 10 00 10 00 05 0A 00 00 01 F4 00 00 07 D0 00 FA E4 E5"),
