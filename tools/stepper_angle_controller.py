@@ -5,8 +5,12 @@ import queue
 import re
 import struct
 import threading
+import tkinter as tk
+from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
+from tkinter import font as tkfont
+from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 
@@ -791,3 +795,587 @@ class SerialController:
                 "串口后台任务已关闭",
                 {"connected": False, "following": False, "shutdown": True},
             )
+
+
+# StepperControllerApp：提供步进电机角度跟随与手动调试图形界面
+# 参数：controller - 后台串口控制器；port_lister - 可替换的串口枚举函数
+# 返回值：StepperControllerApp - Tkinter主窗口
+class StepperControllerApp(tk.Tk):
+    LOG_MAX_LINES = 2000
+    LOG_TRIM_LINES = 200
+    POLL_INTERVAL_MS = 50
+
+    # StepperControllerApp.__init__：初始化窗口状态、控件和后台事件轮询
+    # 参数：controller - 后台串口控制器；port_lister - 可替换的串口枚举函数
+    # 返回值：无
+    def __init__(
+        self,
+        controller: SerialController | None = None,
+        port_lister: Callable[[], list[str]] | None = None,
+    ) -> None:
+        super().__init__()
+        self.controller = controller or SerialController()
+        self._port_lister = port_lister or self._list_serial_ports
+        self._connected = False
+        self._angle_connected = False
+        self._following = False
+        self._closing = False
+        self._log_line_count = 0
+
+        self.title("步进电机角度跟随控制器")
+        self.minsize(820, 720)
+        self.geometry("920x780")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._create_variables()
+        self._create_widgets()
+        self._refresh_ports()
+        self._update_manual_preview("45.00")
+        self._update_control_states()
+        self.after(self.POLL_INTERVAL_MS, self._poll_events)
+
+    # StepperControllerApp._create_variables：创建界面使用的Tk状态变量
+    # 参数：无
+    # 返回值：无
+    def _create_variables(self) -> None:
+        self.driver_port_var = tk.StringVar()
+        self.angle_port_var = tk.StringVar()
+        self.baudrate_var = tk.StringVar(value="115200")
+        self.slave_address_var = tk.StringVar(value="1")
+        self.mode_var = tk.StringVar(value="manual")
+        self.raw_data_var = tk.StringVar(value="--")
+        self.valid_angle_var = tk.StringVar(value="--")
+        self.target_step_var = tk.StringVar(value="--")
+        self.driver_status_var = tk.StringVar(value="未连接")
+        self.last_response_var = tk.StringVar(value="--")
+        self.manual_angle_var = tk.StringVar(value="45.00")
+        self.slider_angle_var = tk.DoubleVar(value=45.0)
+        self.manual_error_var = tk.StringVar()
+
+    # StepperControllerApp._create_widgets：按功能区域创建并排列全部控件
+    # 参数：无
+    # 返回值：无
+    def _create_widgets(self) -> None:
+        container = ttk.Frame(self, padding=10)
+        container.grid(row=0, column=0, sticky="nsew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(5, weight=1)
+
+        self._create_connection_frame(container)
+        self._create_mode_frame(container)
+        self._create_status_frame(container)
+        self._create_manual_frame(container)
+        self._create_run_frame(container)
+        self._create_log_frame(container)
+
+    # StepperControllerApp._create_connection_frame：创建串口配置和连接操作区域
+    # 参数：parent - 父级容器
+    # 返回值：无
+    def _create_connection_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="串口配置", padding=8)
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        ttk.Label(frame, text="驱动串口").grid(row=0, column=0, padx=4, pady=4)
+        self.driver_port_combo = ttk.Combobox(
+            frame, textvariable=self.driver_port_var, state="readonly", width=18
+        )
+        self.driver_port_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(frame, text="角度串口").grid(row=0, column=2, padx=4, pady=4)
+        self.angle_port_combo = ttk.Combobox(
+            frame, textvariable=self.angle_port_var, state="readonly", width=18
+        )
+        self.angle_port_combo.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
+        self.refresh_button = ttk.Button(
+            frame, text="刷新串口", command=self._refresh_ports
+        )
+        self.refresh_button.grid(row=0, column=4, padx=4, pady=4)
+
+        ttk.Label(frame, text="波特率").grid(row=1, column=0, padx=4, pady=4)
+        self.baudrate_entry = ttk.Entry(frame, textvariable=self.baudrate_var)
+        self.baudrate_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(frame, text="从站地址").grid(row=1, column=2, padx=4, pady=4)
+        self.slave_address_entry = ttk.Entry(
+            frame, textvariable=self.slave_address_var
+        )
+        self.slave_address_entry.grid(
+            row=1, column=3, sticky="ew", padx=4, pady=4
+        )
+        self.connect_button = ttk.Button(
+            frame, text="连接", command=self._connect
+        )
+        self.connect_button.grid(row=1, column=4, padx=4, pady=4, sticky="ew")
+        self.disconnect_button = ttk.Button(
+            frame, text="断开", command=self._disconnect
+        )
+        self.disconnect_button.grid(row=1, column=5, padx=4, pady=4, sticky="ew")
+
+    # StepperControllerApp._create_mode_frame：创建互斥的角度来源选择区域
+    # 参数：parent - 父级容器
+    # 返回值：无
+    def _create_mode_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="角度来源", padding=8)
+        frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.follow_mode_button = ttk.Radiobutton(
+            frame,
+            text="串口跟随模式",
+            variable=self.mode_var,
+            value="follow",
+            command=self._on_mode_changed,
+        )
+        self.follow_mode_button.pack(side="left", padx=12)
+        self.manual_mode_button = ttk.Radiobutton(
+            frame,
+            text="手动调试模式",
+            variable=self.mode_var,
+            value="manual",
+            command=self._on_mode_changed,
+        )
+        self.manual_mode_button.pack(side="left", padx=12)
+
+    # StepperControllerApp._create_status_frame：创建原始输入和运行状态显示区域
+    # 参数：parent - 父级容器
+    # 返回值：无
+    def _create_status_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="实时状态", padding=8)
+        frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(1, weight=1)
+        status_items = (
+            ("原始数据", self.raw_data_var),
+            ("有效角度", self.valid_angle_var),
+            ("映射步数", self.target_step_var),
+            ("驱动状态", self.driver_status_var),
+            ("最近响应", self.last_response_var),
+        )
+        for row, (label, variable) in enumerate(status_items):
+            ttk.Label(frame, text=label).grid(
+                row=row, column=0, sticky="w", padx=4, pady=2
+            )
+            ttk.Label(frame, textvariable=variable).grid(
+                row=row, column=1, sticky="w", padx=8, pady=2
+            )
+
+    # StepperControllerApp._create_manual_frame：创建手动角度预览与单次发送区域
+    # 参数：parent - 父级容器
+    # 返回值：无
+    def _create_manual_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="手动调试", padding=8)
+        frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="角度（°）").grid(row=0, column=0, padx=4, pady=4)
+        self.manual_angle_entry = ttk.Entry(
+            frame, textvariable=self.manual_angle_var, width=12
+        )
+        self.manual_angle_entry.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.manual_angle_entry.bind("<KeyRelease>", self._on_manual_entry_changed)
+        self.manual_error_label = ttk.Label(
+            frame, textvariable=self.manual_error_var, foreground="#B00020"
+        )
+        self.manual_error_label.grid(row=0, column=2, sticky="w", padx=4, pady=4)
+
+        self.angle_scale = ttk.Scale(
+            frame,
+            from_=0.0,
+            to=90.0,
+            variable=self.slider_angle_var,
+            command=self._on_slider_changed,
+        )
+        self.angle_scale.grid(
+            row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=4
+        )
+
+        quick_frame = ttk.Frame(frame)
+        quick_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
+        self.quick_buttons: list[ttk.Button] = []
+        for angle in (0, 30, 45, 60, 90):
+            button = ttk.Button(
+                quick_frame,
+                text=f"{angle}°",
+                command=lambda value=angle: self._set_manual_angle(float(value)),
+            )
+            button.pack(side="left", padx=4)
+            self.quick_buttons.append(button)
+        self.send_button = ttk.Button(
+            quick_frame, text="发送角度", command=self._send_manual_angle
+        )
+        self.send_button.pack(side="left", padx=(20, 4))
+
+    # StepperControllerApp._create_run_frame：创建跟随、停止和急停控制区域
+    # 参数：parent - 父级容器
+    # 返回值：无
+    def _create_run_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="运行控制", padding=8)
+        frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        self.start_follow_button = ttk.Button(
+            frame, text="开始跟随", command=self._start_follow
+        )
+        self.start_follow_button.pack(side="left", padx=4)
+        self.stop_follow_button = ttk.Button(
+            frame, text="停止跟随", command=self._stop_follow
+        )
+        self.stop_follow_button.pack(side="left", padx=4)
+        self.emergency_button = tk.Button(
+            frame,
+            text="电机急停",
+            command=self._emergency_stop,
+            background="#C62828",
+            activebackground="#B71C1C",
+            foreground="white",
+            activeforeground="white",
+            relief="raised",
+            padx=12,
+        )
+        self.emergency_button.pack(side="right", padx=4)
+
+    # StepperControllerApp._create_log_frame：创建带滚动条的只读通信日志区域
+    # 参数：parent - 父级容器
+    # 返回值：无
+    def _create_log_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="通信日志", padding=8)
+        frame.grid(row=5, column=0, sticky="nsew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(frame, height=12, wrap="none", state="disabled")
+        scrollbar = ttk.Scrollbar(
+            frame, orient="vertical", command=self.log_text.yview
+        )
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+    # StepperControllerApp._list_serial_ports：通过pyserial枚举当前可用串口名称
+    # 参数：无
+    # 返回值：list[str] - 按名称排序的串口列表
+    def _list_serial_ports(self) -> list[str]:
+        try:
+            from serial.tools import list_ports
+        except ImportError as error:
+            raise RuntimeError(
+                "未安装pyserial，请运行 python -m pip install pyserial"
+            ) from error
+        return sorted(port.device for port in list_ports.comports())
+
+    # StepperControllerApp._refresh_ports：刷新下拉列表并保留仍然存在的选择
+    # 参数：无
+    # 返回值：无
+    def _refresh_ports(self) -> None:
+        previous_driver = self.driver_port_var.get()
+        previous_angle = self.angle_port_var.get()
+        try:
+            ports = list(self._port_lister())
+        except Exception as error:
+            self._append_log(f"刷新串口失败：{error}")
+            messagebox.showerror("串口刷新失败", str(error), parent=self)
+            return
+        self.driver_port_combo["values"] = ports
+        self.angle_port_combo["values"] = ports
+        self.driver_port_var.set(previous_driver if previous_driver in ports else "")
+        self.angle_port_var.set(previous_angle if previous_angle in ports else "")
+        self._append_log(f"已刷新串口列表，共发现{len(ports)}个端口")
+        self._update_control_states()
+
+    # StepperControllerApp._read_settings：读取并校验当前界面连接参数
+    # 参数：require_angle - 是否要求必须选择角度串口
+    # 返回值：ConnectionSettings - 通过校验的连接配置
+    def _read_settings(self, require_angle: bool = False) -> ConnectionSettings:
+        driver_port = self.driver_port_var.get().strip()
+        angle_port = self.angle_port_var.get().strip() or None
+        if not driver_port:
+            raise ValueError("必须选择驱动串口")
+        if require_angle and not angle_port:
+            raise ValueError("串口跟随模式必须选择角度串口")
+        if angle_port and angle_port.casefold() == driver_port.casefold():
+            raise ValueError("角度串口和驱动串口不能相同")
+        try:
+            baudrate = int(self.baudrate_var.get().strip())
+        except ValueError as error:
+            raise ValueError("波特率必须是正整数") from error
+        if baudrate <= 0:
+            raise ValueError("波特率必须是正整数")
+        try:
+            slave_address = int(self.slave_address_var.get().strip())
+        except ValueError as error:
+            raise ValueError("Modbus从站地址必须位于1～254") from error
+        validate_slave_address(slave_address)
+        return ConnectionSettings(
+            driver_port=driver_port,
+            angle_port=angle_port if require_angle else None,
+            baudrate=baudrate,
+            slave_address=slave_address,
+        )
+
+    # StepperControllerApp._show_input_error：记录并弹窗显示界面参数错误
+    # 参数：message - 中文错误信息
+    # 返回值：无
+    def _show_input_error(self, message: str) -> None:
+        self._append_log(message)
+        messagebox.showerror("输入错误", message, parent=self)
+
+    # StepperControllerApp._connect：校验配置并提交后台连接命令
+    # 参数：无
+    # 返回值：无
+    def _connect(self) -> None:
+        try:
+            settings = self._read_settings(require_angle=self.mode_var.get() == "follow")
+        except ValueError as error:
+            self._show_input_error(str(error))
+            return
+        self.driver_status_var.set("正在连接…")
+        self.connect_button.configure(state="disabled")
+        self.controller.submit(ControllerCommand("connect", settings))
+
+    # StepperControllerApp._disconnect：提交停止跟随并断开串口命令
+    # 参数：无
+    # 返回值：无
+    def _disconnect(self) -> None:
+        self.controller.submit(ControllerCommand("disconnect"))
+
+    # StepperControllerApp._on_mode_changed：切换角度来源并停止当前串口跟随
+    # 参数：无
+    # 返回值：无
+    def _on_mode_changed(self) -> None:
+        if self._connected:
+            # 无条件排入停止命令，可覆盖尚未处理完成的开始跟随操作。
+            self.controller.submit(ControllerCommand("stop_follow"))
+        self._following = False
+        self._append_log(
+            "已切换到串口跟随模式"
+            if self.mode_var.get() == "follow"
+            else "已切换到手动调试模式"
+        )
+        self._update_control_states()
+
+    # StepperControllerApp._update_manual_preview：校验并显示手动角度对应步数
+    # 参数：text - 手动角度文本
+    # 返回值：float或None - 合法角度，非法时返回None
+    def _update_manual_preview(self, text: str) -> float | None:
+        try:
+            angle = parse_manual_angle(text)
+        except ValueError as error:
+            self.manual_error_var.set(str(error))
+            return None
+        target_step = angle_to_step(angle)
+        self.manual_error_var.set("")
+        self.valid_angle_var.set(f"{angle:.2f}°")
+        self.target_step_var.set(str(target_step))
+        return angle
+
+    # StepperControllerApp._on_manual_entry_changed：在手动输入变化时同步滑块和预览
+    # 参数：event - Tkinter键盘事件
+    # 返回值：无
+    def _on_manual_entry_changed(self, event: tk.Event | None = None) -> None:
+        del event
+        angle = self._update_manual_preview(self.manual_angle_var.get())
+        if angle is not None:
+            self.slider_angle_var.set(angle)
+
+    # StepperControllerApp._on_slider_changed：拖动滑块时更新两位小数输入和预览
+    # 参数：value - 滑块当前值文本
+    # 返回值：无
+    def _on_slider_changed(self, value: str) -> None:
+        angle = float(value)
+        text = f"{angle:.2f}"
+        self.manual_angle_var.set(text)
+        self._update_manual_preview(text)
+
+    # StepperControllerApp._set_manual_angle：由快捷按钮设置手动预览角度
+    # 参数：angle - 快捷角度
+    # 返回值：无
+    def _set_manual_angle(self, angle: float) -> None:
+        self.slider_angle_var.set(angle)
+        text = f"{angle:.2f}"
+        self.manual_angle_var.set(text)
+        self._update_manual_preview(text)
+
+    # StepperControllerApp._send_manual_angle：校验后提交一次手动位置命令
+    # 参数：无
+    # 返回值：无
+    def _send_manual_angle(self) -> None:
+        angle = self._update_manual_preview(self.manual_angle_var.get())
+        if angle is None:
+            self._append_log("手动角度无效，未发送位置命令")
+            return
+        self.controller.submit(ControllerCommand("manual_angle", angle))
+
+    # StepperControllerApp._start_follow：校验串口配置并提交开始跟随命令
+    # 参数：无
+    # 返回值：无
+    def _start_follow(self) -> None:
+        try:
+            settings = self._read_settings(require_angle=True)
+        except ValueError as error:
+            self._show_input_error(str(error))
+            return
+        self.controller.submit(ControllerCommand("start_follow", settings))
+
+    # StepperControllerApp._stop_follow：提交停止读取角度和发送新目标命令
+    # 参数：无
+    # 返回值：无
+    def _stop_follow(self) -> None:
+        self.controller.submit(ControllerCommand("stop_follow"))
+
+    # StepperControllerApp._emergency_stop：确认后提交急停命令并立即停止界面跟随态
+    # 参数：无
+    # 返回值：无
+    def _emergency_stop(self) -> None:
+        confirmed = messagebox.askyesno(
+            "确认急停",
+            "确定立即停止电机吗？急停后串口跟随将停止。",
+            icon="warning",
+            parent=self,
+        )
+        if not confirmed:
+            return
+        self._following = False
+        self.driver_status_var.set("正在执行急停…")
+        self._update_control_states()
+        self.controller.submit(ControllerCommand("emergency_stop"))
+
+    # StepperControllerApp._handle_event：把一条后台事件同步到状态区和日志
+    # 参数：event - 后台控制器事件
+    # 返回值：无
+    def _handle_event(self, event: ControllerEvent) -> None:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.kind == "status":
+            if "connected" in payload:
+                self._connected = bool(payload["connected"])
+            if "angle_connected" in payload:
+                self._angle_connected = bool(payload["angle_connected"])
+            elif not self._connected:
+                self._angle_connected = False
+            if "following" in payload:
+                self._following = bool(payload["following"])
+            self.driver_status_var.set(event.message)
+        elif event.kind == "angle":
+            raw = payload.get("raw", b"")
+            if isinstance(raw, bytes):
+                self.raw_data_var.set(raw.decode("ascii", errors="replace").strip())
+            self.valid_angle_var.set(f"{float(payload['angle']):.2f}°")
+            self.target_step_var.set(str(payload["step"]))
+        elif event.kind == "rx":
+            raw_response = event.payload if isinstance(event.payload, bytes) else b""
+            self.last_response_var.set(
+                format_hex(raw_response) if raw_response else event.message
+            )
+        elif event.kind == "error":
+            self.driver_status_var.set(event.message)
+            if "跟随已停止" in event.message:
+                self._following = False
+            if "角度串口读取失败" in event.message:
+                self._angle_connected = False
+        self._append_log(event.message)
+        self._update_control_states()
+
+    # StepperControllerApp._poll_events：每50毫秒清空后台事件队列并刷新界面
+    # 参数：无
+    # 返回值：无
+    def _poll_events(self) -> None:
+        while True:
+            try:
+                event = self.controller.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_event(event)
+        if not self._closing:
+            self.after(self.POLL_INTERVAL_MS, self._poll_events)
+
+    # StepperControllerApp._append_log：按固定时间格式追加日志并限制总行数
+    # 参数：message - 待显示的日志内容
+    # 返回值：无
+    def _append_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{timestamp}] {message}\n")
+        self._log_line_count += 1
+        if self._log_line_count > self.LOG_MAX_LINES:
+            self.log_text.delete("1.0", f"{self.LOG_TRIM_LINES + 1}.0")
+            self._log_line_count -= self.LOG_TRIM_LINES
+        self.log_text.configure(state="disabled")
+        self.log_text.see("end")
+
+    # StepperControllerApp._update_control_states：按连接、模式和跟随状态更新控件可用性
+    # 参数：无
+    # 返回值：无
+    def _update_control_states(self) -> None:
+        manual_mode = self.mode_var.get() == "manual"
+        connected_state = "normal" if self._connected else "disabled"
+        self.connect_button.configure(state="disabled" if self._connected else "normal")
+        self.disconnect_button.configure(state=connected_state)
+        self.emergency_button.configure(state=connected_state)
+        self.send_button.configure(
+            state="normal" if self._connected and manual_mode else "disabled"
+        )
+        for widget in [self.manual_angle_entry, self.angle_scale, *self.quick_buttons]:
+            widget.configure(state="normal" if manual_mode else "disabled")
+
+        can_start = (
+            self._connected
+            and not manual_mode
+            and self._angle_connected
+            and not self._following
+        )
+        self.start_follow_button.configure(state="normal" if can_start else "disabled")
+        self.stop_follow_button.configure(
+            state="normal" if self._connected and self._following else "disabled"
+        )
+
+        # 已连接期间锁定通信参数，防止界面显示与后台实际连接配置不一致。
+        config_state = "disabled" if self._connected else "normal"
+        combo_state = "disabled" if self._connected else "readonly"
+        self.driver_port_combo.configure(state=combo_state)
+        self.angle_port_combo.configure(state=combo_state)
+        self.baudrate_entry.configure(state=config_state)
+        self.slave_address_entry.configure(state=config_state)
+        self.refresh_button.configure(state=config_state)
+
+    # StepperControllerApp._on_close：关闭后台线程后销毁窗口且不隐式发送急停
+    # 参数：无
+    # 返回值：无
+    def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self.controller.shutdown(timeout=1.0)
+        self.destroy()
+
+
+# _configure_default_font：按Windows缩放设置适合中文显示的Tk默认字体
+# 参数：root - 已创建的Tk根窗口
+# 返回值：无
+def _configure_default_font(root: tk.Tk) -> None:
+    family = (
+        "Microsoft YaHei UI"
+        if root.tk.call("tk", "windowingsystem") == "win32"
+        else "TkDefaultFont"
+    )
+    default_font = tkfont.nametofont("TkDefaultFont")
+    default_font.configure(family=family, size=10)
+    root.option_add("*Font", default_font)
+
+
+# main：检查运行依赖并启动步进电机控制器图形界面
+# 参数：无
+# 返回值：无
+def main() -> None:
+    try:
+        import serial  # noqa: F401
+    except ImportError:
+        root = tk.Tk()
+        root.withdraw()
+        message = "未安装pyserial，请运行：\npython -m pip install pyserial"
+        print(message)
+        messagebox.showerror("缺少依赖", message, parent=root)
+        root.destroy()
+        return
+
+    app = StepperControllerApp()
+    _configure_default_font(app)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
