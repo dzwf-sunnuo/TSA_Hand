@@ -2,6 +2,7 @@ import math
 import queue
 import threading
 import time
+import tkinter as tk
 
 import pytest
 
@@ -12,6 +13,7 @@ from tools.stepper_angle_controller import (
     ControllerCommand,
     ControllerEvent,
     SerialController,
+    StepperControllerApp,
     angle_to_step,
     build_emergency_stop_request,
     build_position_request,
@@ -22,6 +24,31 @@ from tools.stepper_angle_controller import (
     parse_stream_angle,
     validate_modbus_response,
 )
+
+
+# RecordingController：记录图形界面提交的命令且不访问真实串口
+# 参数：无
+# 返回值：RecordingController - 图形界面回归测试用控制器
+class RecordingController:
+    # RecordingController.__init__：初始化事件队列和命令记录
+    # 参数：无
+    # 返回值：无
+    def __init__(self) -> None:
+        self.event_queue: queue.Queue[ControllerEvent] = queue.Queue()
+        self.commands: list[ControllerCommand] = []
+
+    # RecordingController.submit：记录界面提交的一条后台命令
+    # 参数：command - 界面提交的控制命令
+    # 返回值：无
+    def submit(self, command: ControllerCommand) -> None:
+        self.commands.append(command)
+
+    # RecordingController.shutdown：模拟后台线程成功退出
+    # 参数：timeout - 最长等待秒数
+    # 返回值：bool - 固定返回True
+    def shutdown(self, timeout: float = 1.0) -> bool:
+        del timeout
+        return True
 
 
 @pytest.mark.parametrize(
@@ -564,3 +591,45 @@ def test_controller_closes_both_ports_on_shutdown() -> None:
     assert set(driver.operation_thread_ids + angle.operation_thread_ids) == {
         controller._thread.ident
     }
+
+
+# test_gui_can_select_angle_port_after_manual_connection：验证手动连接后无需重连即可选择角度串口并开始跟随
+# 参数：无
+# 返回值：无
+def test_gui_can_select_angle_port_after_manual_connection() -> None:
+    controller = RecordingController()
+    try:
+        app = StepperControllerApp(
+            controller=controller,
+            port_lister=lambda: ["DRIVER", "ANGLE"],
+        )
+    except tk.TclError as error:
+        pytest.skip(f"当前环境无法创建Tk窗口：{error}")
+
+    try:
+        app.driver_port_var.set("DRIVER")
+        app._handle_event(
+            ControllerEvent(
+                "status",
+                "驱动串口连接成功",
+                {
+                    "connected": True,
+                    "angle_connected": False,
+                    "following": False,
+                },
+            )
+        )
+        app.mode_var.set("follow")
+        app._on_mode_changed()
+        assert str(app.angle_port_combo.cget("state")) == "readonly"
+        assert str(app.start_follow_button.cget("state")) == "disabled"
+
+        app.angle_port_var.set("ANGLE")
+        assert str(app.start_follow_button.cget("state")) == "normal"
+        app._start_follow()
+
+        command = controller.commands[-1]
+        assert command.kind == "start_follow"
+        assert command.payload == ConnectionSettings("DRIVER", "ANGLE", 115200, 1)
+    finally:
+        app.destroy()

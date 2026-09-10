@@ -829,6 +829,7 @@ class StepperControllerApp(tk.Tk):
 
         self._create_variables()
         self._create_widgets()
+        self.angle_port_var.trace_add("write", self._on_port_selection_changed)
         self._refresh_ports()
         self._update_manual_preview("45.00")
         self._update_control_states()
@@ -1071,11 +1072,21 @@ class StepperControllerApp(tk.Tk):
             self._append_log(f"刷新串口失败：{error}")
             messagebox.showerror("串口刷新失败", str(error), parent=self)
             return
+        # 已打开的驱动端口可能暂时不在枚举结果中，仍保留其显示和选择。
+        if self._connected and previous_driver and previous_driver not in ports:
+            ports.insert(0, previous_driver)
         self.driver_port_combo["values"] = ports
         self.angle_port_combo["values"] = ports
         self.driver_port_var.set(previous_driver if previous_driver in ports else "")
         self.angle_port_var.set(previous_angle if previous_angle in ports else "")
         self._append_log(f"已刷新串口列表，共发现{len(ports)}个端口")
+        self._update_control_states()
+
+    # StepperControllerApp._on_port_selection_changed：串口选择变化时刷新按钮状态
+    # 参数：args - Tk变量追踪回调参数
+    # 返回值：无
+    def _on_port_selection_changed(self, *args: str) -> None:
+        del args
         self._update_control_states()
 
     # StepperControllerApp._read_settings：读取并校验当前界面连接参数
@@ -1210,6 +1221,8 @@ class StepperControllerApp(tk.Tk):
         except ValueError as error:
             self._show_input_error(str(error))
             return
+        self.start_follow_button.configure(state="disabled")
+        self.driver_status_var.set("正在启动串口跟随…")
         self.controller.submit(ControllerCommand("start_follow", settings))
 
     # StepperControllerApp._stop_follow：提交停止读取角度和发送新目标命令
@@ -1312,10 +1325,15 @@ class StepperControllerApp(tk.Tk):
         for widget in [self.manual_angle_entry, self.angle_scale, *self.quick_buttons]:
             widget.configure(state="normal" if manual_mode else "disabled")
 
+        driver_port = self.driver_port_var.get().strip()
+        angle_port = self.angle_port_var.get().strip()
+        angle_selection_valid = bool(angle_port) and (
+            angle_port.casefold() != driver_port.casefold()
+        )
         can_start = (
             self._connected
             and not manual_mode
-            and self._angle_connected
+            and angle_selection_valid
             and not self._following
         )
         self.start_follow_button.configure(state="normal" if can_start else "disabled")
@@ -1325,12 +1343,15 @@ class StepperControllerApp(tk.Tk):
 
         # 已连接期间锁定通信参数，防止界面显示与后台实际连接配置不一致。
         config_state = "disabled" if self._connected else "normal"
-        combo_state = "disabled" if self._connected else "readonly"
-        self.driver_port_combo.configure(state=combo_state)
-        self.angle_port_combo.configure(state=combo_state)
+        driver_combo_state = "disabled" if self._connected else "readonly"
+        angle_combo_state = "disabled" if self._following else "readonly"
+        self.driver_port_combo.configure(state=driver_combo_state)
+        self.angle_port_combo.configure(state=angle_combo_state)
         self.baudrate_entry.configure(state=config_state)
         self.slave_address_entry.configure(state=config_state)
-        self.refresh_button.configure(state=config_state)
+        self.refresh_button.configure(
+            state="disabled" if self._following else "normal"
+        )
 
     # StepperControllerApp._on_close：关闭后台线程后销毁窗口且不隐式发送急停
     # 参数：无
@@ -1362,7 +1383,7 @@ def _configure_default_font(root: tk.Tk) -> None:
 # 返回值：无
 def main() -> None:
     try:
-        import serial  # noqa: F401
+        __import__("serial")
     except ImportError:
         root = tk.Tk()
         root.withdraw()
