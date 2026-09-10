@@ -3,6 +3,7 @@
 import math
 import re
 import struct
+import threading
 from decimal import Decimal, ROUND_HALF_UP
 
 
@@ -17,6 +18,61 @@ POSITION_SPEED = 2000
 POSITION_ACCELERATION_TIME = 250
 EMERGENCY_STOP_ADDRESS = 0x0004
 STREAM_ANGLE_PATTERN = re.compile(r"^\d{1,2}\.\d{2}$")
+MODBUS_EXCEPTION_MESSAGES = {
+    1: "功能码错误",
+    2: "地址错误",
+    3: "长度错误",
+}
+
+
+# ModbusProtocolError：表示Modbus响应违反协议或返回异常码
+# 参数：message - 协议错误说明
+# 返回值：ModbusProtocolError - 可由上层捕获的协议异常
+class ModbusProtocolError(Exception):
+    """Modbus响应校验失败。"""
+
+
+# LatestTargetBuffer：线程安全地合并最新角度并记录成功发送的步数
+# 参数：无
+# 返回值：LatestTargetBuffer - 最新目标容器
+class LatestTargetBuffer:
+    # LatestTargetBuffer.__init__：初始化空的目标和成功发送记录
+    # 参数：无
+    # 返回值：无
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest_angle: float | None = None
+        self._last_sent_step: int | None = None
+
+    # LatestTargetBuffer.put：用新角度覆盖尚未处理的旧目标
+    # 参数：angle - 最新的有效角度
+    # 返回值：无
+    def put(self, angle: float) -> None:
+        with self._lock:
+            self._latest_angle = angle
+
+    # LatestTargetBuffer.take：取出并清空当前最新角度
+    # 参数：无
+    # 返回值：float或None - 待处理角度，无目标时返回None
+    def take(self) -> float | None:
+        with self._lock:
+            angle = self._latest_angle
+            self._latest_angle = None
+            return angle
+
+    # LatestTargetBuffer.mark_sent：记录已获得有效响应的目标步数
+    # 参数：step - 成功发送的目标步数
+    # 返回值：无
+    def mark_sent(self, step: int) -> None:
+        with self._lock:
+            self._last_sent_step = step
+
+    # LatestTargetBuffer.should_send：判断目标步数是否与最近成功值不同
+    # 参数：step - 待检查的目标步数
+    # 返回值：bool - 需要发送时返回True
+    def should_send(self, step: int) -> bool:
+        with self._lock:
+            return step != self._last_sent_step
 
 
 # parse_stream_angle：解析串口发送的两位小数角度
@@ -80,6 +136,73 @@ def calculate_modbus_crc(data: bytes) -> bytes:
             else:
                 crc >>= 1
     return bytes((crc & 0xFF, (crc >> 8) & 0xFF))
+
+
+# validate_modbus_response：校验写寄存器响应的CRC、从站、功能码和回显字段
+# 参数：response - 完整响应；slave_address - 预期从站地址；function_code - 预期功能码；start_address - 预期起始地址；quantity_or_value - 预期寄存器数量或写入值
+# 返回值：无，校验失败时抛出ModbusProtocolError
+def validate_modbus_response(
+    response: bytes,
+    slave_address: int,
+    function_code: int,
+    start_address: int,
+    quantity_or_value: int,
+) -> None:
+    if len(response) < 5:
+        raise ModbusProtocolError(f"Modbus响应长度不足：{len(response)}字节")
+
+    payload = response[:-2]
+    received_crc = response[-2:]
+    expected_crc = calculate_modbus_crc(payload)
+    if received_crc != expected_crc:
+        raise ModbusProtocolError("Modbus响应CRC校验失败")
+
+    if response[0] != slave_address:
+        raise ModbusProtocolError(
+            f"Modbus从站地址不匹配：收到0x{response[0]:02X}，"
+            f"期望0x{slave_address:02X}"
+        )
+
+    received_function = response[1]
+    exception_function = function_code | 0x80
+    if received_function == exception_function:
+        if len(response) != 5:
+            raise ModbusProtocolError(
+                f"Modbus异常响应长度错误：收到{len(response)}字节，期望5字节"
+            )
+        exception_code = response[2]
+        message = MODBUS_EXCEPTION_MESSAGES.get(
+            exception_code, f"未知异常码0x{exception_code:02X}"
+        )
+        raise ModbusProtocolError(f"Modbus异常响应：{message}")
+
+    if received_function != function_code:
+        raise ModbusProtocolError(
+            f"Modbus功能码不匹配：收到0x{received_function:02X}，"
+            f"期望0x{function_code:02X}"
+        )
+
+    if function_code not in (0x06, 0x10):
+        raise ModbusProtocolError(f"不支持校验功能码0x{function_code:02X}的响应")
+    if len(response) != 8:
+        raise ModbusProtocolError(
+            f"Modbus正常响应长度错误：收到{len(response)}字节，期望8字节"
+        )
+
+    _, _, received_address, received_quantity_or_value = struct.unpack(
+        ">BBHH", payload
+    )
+    if received_address != start_address:
+        raise ModbusProtocolError(
+            f"Modbus起始地址不匹配：收到0x{received_address:04X}，"
+            f"期望0x{start_address:04X}"
+        )
+    if received_quantity_or_value != quantity_or_value:
+        field_name = "寄存器数量" if function_code == 0x10 else "写入值"
+        raise ModbusProtocolError(
+            f"Modbus{field_name}不匹配：收到0x{received_quantity_or_value:04X}，"
+            f"期望0x{quantity_or_value:04X}"
+        )
 
 
 # validate_slave_address：校验Modbus从站地址
