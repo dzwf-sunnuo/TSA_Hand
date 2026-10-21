@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 #define SENSOR_JOINT_COUNT 4U
-#define SENSOR_FORCE_COUNT 3U
+#define SENSOR_FORCE_COUNT 2U
 #define SENSOR_ACQUISITION_HZ 100U
 #define SENSOR_MAX_AGE_MS 50U
 
@@ -20,7 +20,7 @@ typedef struct {
 } SensorForceFeedback_t;
 
 // SensorFeedbackSnapshot_t：供控制和CAN共同读取的完整采集缓存
-// 参数：无；关节下标0～3，力下标0～2对应motor1～3
+// 参数：无；关节下标0～3；力下标0为拇指motor0/1共用，1为食指motor3
 // 返回值：无
 typedef struct {
     uint16_t adc_mean[SENSOR_JOINT_COUNT];
@@ -32,7 +32,7 @@ typedef struct {
     uint8_t angle_valid_mask;
 } SensorFeedbackSnapshot_t;
 
-// SensorFeedback_Init：在TIM13启动后初始化三路传感器和无效缓存
+// SensorFeedback_Init：在TIM13启动后初始化拇指、食指两路传感器和无效缓存
 // 参数：无
 // 返回值：无；校准发送成功不会伪装成有效力数据
 void SensorFeedback_Init(void);

@@ -34,17 +34,19 @@ static uint8_t CanTelemetry_ForceByte(float force)
 
 // CanTelemetry_Encode：使用缓存中的成品角度与力，不重新采样或计算三轴合成
 // 参数：snapshot - 同一采集快照；now_tick - HAL时刻；sequence - 共同序号；data为输出
-// 返回值：true表示三指角度全部有效，false时只允许发送带有效位的力帧
+// 返回值：true表示motor0/1/3角度全部有效，false时只允许发送带有效位的力帧
 bool CanTelemetry_Encode(const MotorTelemetrySnapshot_t *snapshot, uint32_t now_tick,
-                         uint8_t sequence, uint8_t angle_data[7], uint8_t force_data[8])
+                         uint8_t sequence, uint8_t angle_data[8], uint8_t force_data[8])
 {
     if (snapshot == NULL || angle_data == NULL || force_data == NULL) return false;
-    memset(angle_data, 0, 7U);
+    memset(angle_data, 0, 8U);
     memset(force_data, 0, 8U);
     bool angle_valid = SensorFeedback_IsFresh(snapshot->adc_valid,
                                               snapshot->adc_update_tick, now_tick);
-    for (uint8_t channel = 0U; channel < SENSOR_FORCE_COUNT; channel++) {
-        uint8_t motor_index = tactile_motor_indices[channel];
+    // 角度槽独立于物理力传感器：拇指两个关节、食指；motor2不在本帧上报。
+    static const uint8_t angle_motor_indices[3] = {0U, 1U, 3U};
+    for (uint8_t channel = 0U; channel < 3U; channel++) {
+        uint8_t motor_index = angle_motor_indices[channel];
         uint16_t angle = snapshot->joint_angle_tenths[motor_index];
         if ((snapshot->angle_valid_mask & (uint8_t)(1U << motor_index)) == 0U) {
             angle_valid = false;
@@ -52,6 +54,9 @@ bool CanTelemetry_Encode(const MotorTelemetrySnapshot_t *snapshot, uint32_t now_
         if (angle > 900U) angle = 900U;
         angle_data[2U * channel] = (uint8_t)(angle >> 8);
         angle_data[2U * channel + 1U] = (uint8_t)angle;
+    }
+    // 力槽只有拇指、食指两路，D4/5由开头的清零保持为0，有效位bit2也始终为0。
+    for (uint8_t channel = 0U; channel < SENSOR_FORCE_COUNT; channel++) {
         const SensorForceFeedback_t *force = &snapshot->force[channel];
         force_data[2U * channel] = CanTelemetry_ForceByte(force->tangential_force);
         force_data[2U * channel + 1U] = CanTelemetry_ForceByte(force->normal_force);
@@ -60,7 +65,8 @@ bool CanTelemetry_Encode(const MotorTelemetrySnapshot_t *snapshot, uint32_t now_
             force_data[6] |= (uint8_t)(1U << channel);
         }
     }
-    angle_data[6] = sequence;
+    angle_data[6] = 0U; // 预留字节，保留与三路角度数据之间的明确边界
+    angle_data[7] = sequence;
     force_data[7] = sequence;
     return angle_valid;
 }
@@ -157,7 +163,7 @@ static void CanTelemetry_Submit(uint32_t id, uint32_t length, const uint8_t *dat
     CAN_TxHeaderTypeDef header = {0};
     uint32_t mailbox = 0U;
     uint8_t payload[8] = {0};
-    memcpy(payload, data, length); // HAL内部读取两组32位数据，7字节帧也提供完整8字节空间
+    memcpy(payload, data, length); // HAL内部按两组32位数据读取，始终提供完整8字节空间
     header.StdId = id;
     header.IDE = CAN_ID_STD;
     header.RTR = CAN_RTR_DATA;
@@ -179,7 +185,7 @@ static void CanTelemetry_Submit(uint32_t id, uint32_t length, const uint8_t *dat
 void CanTelemetry_Process(uint32_t now_tick)
 {
     MotorTelemetrySnapshot_t snapshot;
-    uint8_t angle_data[7], force_data[8];
+    uint8_t angle_data[8], force_data[8];
     Motor_GetTelemetrySnapshot(&snapshot);
     bool angle_valid = CanTelemetry_Encode(&snapshot, now_tick, s_sequence++,
                                             angle_data, force_data);
@@ -192,7 +198,7 @@ void CanTelemetry_Process(uint32_t now_tick)
     if (Reg[CAN_REPORT_REG_ENABLE] != 0U &&
         Reg[CAN_REPORT_REG_FREQUENCY] == s_applied_frequency &&
         HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) >= (angle_valid ? 2U : 1U)) {
-        if (angle_valid) CanTelemetry_Submit(CAN_TELEMETRY_ANGLE_ID, 7U, angle_data, now_tick);
+        if (angle_valid) CanTelemetry_Submit(CAN_TELEMETRY_ANGLE_ID, 8U, angle_data, now_tick);
         CanTelemetry_Submit(CAN_TELEMETRY_FORCE_ID, 8U, force_data, now_tick);
     } else {
         canTelemetryStats.skipped_groups++;

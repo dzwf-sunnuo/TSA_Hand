@@ -93,7 +93,7 @@ void Modbus_Send_Byte(uint8_t ch)
     }
 }
 
-// Modbus_Init：初始化协议、三指采集使能与默认20Hz的CAN自动上报
+// Modbus_Init：初始化一号板协议、两路采集使能与默认20Hz的CAN自动上报
 // 参数：无
 // 返回值：无
 void Modbus_Init(void)
@@ -107,7 +107,7 @@ void Modbus_Init(void)
     Reg[3] = 0x0000; 
     Reg[4] = 0x0000; 
 
-    // 三路采集与CAN上报均默认开启，电机运动使能仍由Reg[4]独立控制。
+    // 拇指与食指两路采集、CAN上报均默认开启，电机运动使能仍由Reg[4]独立控制。
     Reg[TACTILE_REG_ENABLE] = TACTILE_DEFAULT_ENABLE;
     Reg[CAN_REPORT_REG_ENABLE] = CAN_REPORT_DEFAULT_ENABLE;
     Reg[CAN_REPORT_REG_FREQUENCY] = CAN_REPORT_DEFAULT_FREQUENCY;

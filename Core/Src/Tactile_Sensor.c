@@ -7,7 +7,7 @@
 #define TACTILE_IO_TIMEOUT_MS 2U
 #define TACTILE_CS_WAIT_US 10U
 #define TACTILE_DATA_WAIT_US 30U
-#define MAX_SENSORS 3U
+#define MAX_SENSORS 2U // 一号板只有拇指和食指两个物理传感器
 
 static Tactile_Sensor_t *s_sensors[MAX_SENSORS];
 static uint8_t s_sensor_count;

@@ -12,7 +12,7 @@
 #define MODBUS_BUF_SIZE 200
 #define MODBUS_RX_QUEUE_LENGTH 4
 
-#define RS485_SLAVE_ADDR 0x02 // 从机地址（可根据需要修改）
+#define RS485_SLAVE_ADDR 0x01 // 一号板：拇指三个自由度与食指
 
 // LED 闪烁参数: 4 次翻转 = 2 闪, 总时长 = BLINK_PERIOD × 4
 #define LED_BLINK_PERIOD_MS  50U
@@ -33,10 +33,10 @@
 #define ADM_REG_B  16    // 回弹刚度 ×1000
 #define ADM_REG_DAMP 17  // 虚拟阻尼 ×1000 (16=0.016, 越小响应越快)
 
-// SPI采集位按实际电机编号定义：bit1/2/3分别为中指/无名指/小指。
-// bit0及其他位不绑定传感器，采集开关不控制电机运动使能。
+// SPI采集位继续按电机编号定义：bit0/1共用拇指NSS1，bit3对应食指NSS2。
+// bit0或bit1任一开启便采集NSS1；bit2及其他位无传感器，采集开关不控制电机使能。
 #define TACTILE_REG_ENABLE 18U
-#define TACTILE_DEFAULT_ENABLE 0x000EU
+#define TACTILE_DEFAULT_ENABLE 0x000BU
 
 // CAN统一开关只允许0/1；频率单位Hz，两条反馈共用，复位恢复默认。
 #define CAN_REPORT_REG_ENABLE 19U

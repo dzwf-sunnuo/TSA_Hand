@@ -281,7 +281,7 @@ void vModbusCommTask(void *argument)
   }
 }
 
-// vSensorProcessTask：每10毫秒完成一批ADC与三路SPI并发布完整缓存
+// vSensorProcessTask：每10毫秒完成一批ADC与拇指、食指两路SPI并发布完整缓存
 // 参数：argument - 未使用
 // 返回值：无；绝对周期累计调度，超期计数并跳过旧周期
 void vSensorProcessTask(void *argument)
@@ -342,7 +342,7 @@ void vSystemMonitorTask(void *argument)
         printf("EXPERIMENT_STOP\r\n");
         experiment_event = 0U;
       }*/
-      Print_Motor_Status(tactile_motor_indices[0], 101); // 默认输出中指motor1的FF数据帧
+      Print_Motor_Status(0U, 101); // 默认输出拇指motor0与NSS1力缓存的FF数据帧
     }
 
   }

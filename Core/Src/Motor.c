@@ -10,8 +10,10 @@
 #include "angle_codec.h"
 #include "sensor_feedback.h"
 
-/* 本板三路触觉导纳：中指、无名指、小指对应motor1、motor2、motor3 */
-#define TACTILE_FINGER_COUNT 3U
+/* 一号板两路触觉：拇指motor0/1共用NSS1，食指motor3使用NSS2；motor2不接入导纳。 */
+#define TACTILE_FINGER_COUNT SENSOR_FORCE_COUNT
+#define THUMB_MIN_JOINT_ANGLE 5.0f
+#define POSITION_ADC_DEADBAND 5.0f
 #define TACTILE_FORCE_LIMIT_N 15.0f
 #define MODE6_RESTART_FLAG 0x01U
 #define MODE7_RESTART_FLAG 0x02U
@@ -23,11 +25,11 @@ __CCM_RAM_DATA static Admittance_Ctrl adm_ctrl[TACTILE_FINGER_COUNT];
 __CCM_RAM_DATA static uint8_t mode6_force_locked[TACTILE_FINGER_COUNT] = {0};
 __CCM_RAM_DATA static uint8_t mode7_force_locked[TACTILE_FINGER_COUNT] = {0};
 
-// 唯一的电机/触觉通道对应表，采集、控制、调试与CAN共同使用。
-const uint8_t tactile_motor_indices[TACTILE_FINGER_COUNT] = {1U, 2U, 3U};
-static const char *const tactile_sensor_names[TACTILE_FINGER_COUNT] = {
-    "Middle", "Ring", "Little"
-};
+// 两路物理传感器的采集使能掩码：拇指bit0/1任一开启即采集，食指使用bit3。
+const uint16_t tactile_enable_masks[TACTILE_FINGER_COUNT] = {0x0003U, 0x0008U};
+static const char *const tactile_sensor_names[TACTILE_FINGER_COUNT] = {"Thumb", "Index"};
+// 模式6/7分别记录第一关节是否已经到达分配边界，避免提前让第二关节退让。
+static uint8_t thumb_secondary_ready[2] = {0U, 0U};
 
 /* 堵转保护 */
 #define STALL_TIMEOUT_SECONDS 5.0f   // 堵转判定时间 (秒)
@@ -38,7 +40,7 @@ static const char *const tactile_sensor_names[TACTILE_FINGER_COUNT] = {
  * @brief 硬件配置映射表
  * 
  * 将每个电机对应的 PWM 定时器、通道以及编码器定时器进行解耦映射。
- * 顺序对应：电机 0 (食指), 电机 1 (中指), 电机 2 (无名指), 电机 3 (小指)。
+ * 顺序对应：电机0/1/2为拇指三个自由度，电机3为食指；电气接线顺序保持不变。
  * 两次板子接口不一致
  */
 
@@ -108,7 +110,7 @@ __CCM_RAM_DATA float Kp_Speed[Motor_Num] = {0.3f, 0.3f, 0.3f, 0.3f} ;
 __CCM_RAM_DATA float Ki_Speed[Motor_Num] = {0.1f, 0.1f, 0.1f, 0.1f} ;
 __CCM_RAM_DATA float Kd_Speed[Motor_Num] = {0.0f, 0.0f, 0.0f, 0.0f} ;
 
-// Motor_Init：初始化电机与原有PID，并绑定本板三指触觉采集
+// Motor_Init：初始化电机与原有PID，并绑定本板拇指、食指两路触觉采集
 // 参数：无；须在TIM13启动后调用
 // 返回值：无
 void Motor_Init(void)
@@ -181,7 +183,7 @@ void Motor_Init(void)
     Reg[ADM_REG_B]    = 1000; // K_return  = 1.000
     Reg[ADM_REG_DAMP] = 0x0010; // B_damp = 0.016
 
-    // 初始化三套独立导纳控制器和触觉传感器
+    // 初始化拇指与食指两套导纳控制器；拇指两个关节只共享一套状态
     for (uint8_t i = 0U; i < TACTILE_FINGER_COUNT; i++) {
         Admittance_Init(&adm_ctrl[i], 0.0f, 0.016f, 0.032f, 70.0f);
     }
@@ -242,6 +244,136 @@ void PID_UpdateGains(void)
     }
 }
 
+// Motor_StopFeedbackControl：反馈或目标无效时停止单路输出并清理闭环历史
+// 参数：motor_index - 电机编号0～3
+// 返回值：无；保留目标、导纳状态和超限锁定，等待有效反馈恢复
+static void Motor_StopFeedbackControl(uint8_t motor_index)
+{
+    motor[motor_index].TargetSpeed = 0.0f;
+    PID_Position[motor_index].Out_Last = 0.0f;
+    PID_Position[motor_index].Error_Last1 = PID_Position[motor_index].Error_Last2 = 0.0f;
+    PID_Angle[motor_index].Out_Last = 0.0f;
+    PID_Angle[motor_index].Error_Last1 = PID_Angle[motor_index].Error_Last2 = 0.0f;
+    PID_Speed[motor_index].Out_Last = 0.0f;
+    PID_Speed[motor_index].Error_Last1 = PID_Speed[motor_index].Error_Last2 = 0.0f;
+    Set_Motor(motor_index, 0, 0);
+}
+
+// Motor_PrepareAdmittanceTargets：每周期只更新两次物理导纳，并统一分配拇指两关节目标
+// 参数：mode - 模式6或7；io_flag - 总使能；feedback - 同一采集快照；now_ms - 当前毫秒
+// 参数：adc_fresh - ADC是否新鲜；targets - 四路目标输出（模式6为圈数、模式7为度）；ready - 四路目标有效标志
+// 返回值：无；触觉失效或拇指任一BCD非法时暂停对应的一整组关节，motor2始终按无力目标处理
+static void Motor_PrepareAdmittanceTargets(uint8_t mode, uint8_t io_flag,
+    const SensorFeedbackSnapshot_t *feedback, uint32_t now_ms, bool adc_fresh,
+    float targets[Motor_Num], bool ready[Motor_Num])
+{
+    if (mode != 6U && mode != 7U) return;
+    const bool joint_mode = mode == 7U;
+    const float minimum = joint_mode ? THUMB_MIN_JOINT_ANGLE : 0.0f;
+    const uint8_t phase_index = joint_mode ? 1U : 0U;
+    uint8_t *locked = joint_mode ? mode7_force_locked : mode6_force_locked;
+    static uint16_t previous_thumb_base[2][2] = {{0U, 0U}, {0U, 0U}};
+    // 改写任一拇指基准后重新确认到位，不能沿用上一组目标的第二关节放行状态。
+    if (previous_thumb_base[phase_index][0] != Reg[0] ||
+        previous_thumb_base[phase_index][1] != Reg[1]) {
+        thumb_secondary_ready[phase_index] = 0U;
+        previous_thumb_base[phase_index][0] = Reg[0];
+        previous_thumb_base[phase_index][1] = Reg[1];
+    }
+
+    for (uint8_t i = 0U; i < Motor_Num; i++) {
+        if (joint_mode) {
+            uint16_t tenths = 0U;
+            ready[i] = adc_fresh && (feedback->angle_valid_mask & (uint8_t)(1U << i)) != 0U &&
+                AngleCodec_DecodeBcdTenths(Reg[i], &tenths);
+            targets[i] = (float)tenths * 0.1f;
+            if (targets[i] < minimum) targets[i] = minimum;
+            if (targets[i] > 90.0f) targets[i] = 90.0f;
+        } else {
+            ready[i] = true;
+            targets[i] = (float)(Reg[i] >> 8); // 保留基准圈数，退让分配完成后再做输出轴限幅
+        }
+    }
+    // 两个拇指关节共用总退让量，任意一个基准不合法时不能单独驱动另一个。
+    if (!ready[0] || !ready[1]) ready[0] = ready[1] = false;
+
+    for (uint8_t channel = 0U; channel < TACTILE_FINGER_COUNT; channel++) {
+        uint8_t first = channel == 0U ? 0U : 3U;
+        uint8_t last = channel == 0U ? 1U : 3U;
+        const SensorForceFeedback_t *force_sample = &feedback->force[channel];
+        if (!ready[first] || !ready[last] ||
+            !SensorFeedback_IsFresh(force_sample->valid, force_sample->last_update_tick, now_ms) ||
+            !isfinite(force_sample->f_sum)) {
+            ready[first] = ready[last] = false;
+            continue;
+        }
+        float force = force_sample->f_sum;
+        if (force > TACTILE_FORCE_LIMIT_N) {
+            locked[channel] = 1U;
+            Admittance_Reset(&adm_ctrl[channel]);
+            // 一个拇指传感器超限同时锁定motor0/1；食指只改变motor3，motor2不受影响。
+            for (uint8_t i = first; i <= last; i++) Reg[i] = joint_mode ? 0x0050U : 0x0064U;
+        }
+        if (locked[channel] != 0U) {
+            targets[first] = targets[last] = minimum;
+            if (channel == 0U) thumb_secondary_ready[phase_index] = 0U;
+            continue;
+        }
+
+        // 使能关闭时冻结导纳积分，重新使能后从现有退让量继续；每物理通道每周期仅更新一次。
+        float retreat = adm_ctrl[channel].x;
+        adm_ctrl[channel].x_max = joint_mode ? 40.0f : 70.0f;
+        if (io_flag != 0U) {
+            adm_ctrl[channel].B = (float)Reg[ADM_REG_DAMP] * 0.001f;
+            adm_ctrl[channel].K = (float)Reg[force > 0.1f ? ADM_REG_K : ADM_REG_B] * 0.001f;
+            retreat = Admittance_Update(&adm_ctrl[channel], force, 1.0f / (float)CONTROL_FREQ_HZ);
+        }
+        if (!isfinite(retreat)) {
+            Admittance_Reset(&adm_ctrl[channel]);
+            ready[first] = ready[last] = false;
+            continue;
+        }
+        if (retreat < 0.0f) retreat = 0.0f;
+        if (retreat > adm_ctrl[channel].x_max) retreat = adm_ctrl[channel].x_max;
+
+        if (channel == 0U) {
+            float first_capacity = targets[0] - minimum;
+            float first_retreat = retreat < first_capacity ? retreat : first_capacity;
+            float remaining = retreat - first_retreat;
+            targets[0] -= first_retreat;
+            if (remaining <= 0.0f) {
+                thumb_secondary_ready[phase_index] = 0U;
+            } else if (joint_mode) {
+                // 目标最低为5°，到达判断包含原位置环5个ADC码死区，防止严格小于5°永远无法触发。
+                float boundary_adc = lineInterp(JointAngle[0], ADValue[0], CalibrationLEN,
+                    THUMB_MIN_JOINT_ANGLE, InterpolationFlag[0]);
+                if (feedback->joint_angle_tenths[0] <= 50U ||
+                    fabsf((float)feedback->adc_mean[0] - boundary_adc) <= POSITION_ADC_DEADBAND) {
+                    thumb_secondary_ready[phase_index] = 1U;
+                }
+            } else if (fabsf(motor[0].CurrentAngle) <= Real_OneTurn * 0.01f) {
+                // 模式6按编码器圈数分配，以0圈附近（0.01圈容差）作为第二关节启动条件。
+                thumb_secondary_ready[phase_index] = 1U;
+            }
+            // 尚未实际到达边界时，motor1维持自己的基准目标，不提前消耗剩余退让量。
+            if (thumb_secondary_ready[phase_index] != 0U) targets[1] -= remaining;
+            if (targets[1] < minimum) targets[1] = minimum;
+        } else {
+            targets[3] -= retreat;
+            // 模式6食指保留原有允许负向输出轴退让的范围，模式7仍限制最低5°。
+            float lower = joint_mode ? minimum : -40.0f;
+            if (targets[3] < lower) targets[3] = lower;
+        }
+    }
+    if (!joint_mode) {
+        // 延续原模式6的“先减退让、再限制目标”顺序，不能先截断基准圈数改变导纳结果。
+        for (uint8_t i = 0U; i < Motor_Num; i++) {
+            if (targets[i] > 40.0f) targets[i] = 40.0f;
+            if (targets[i] < -40.0f) targets[i] = -40.0f;
+        }
+    }
+}
+
 // Motor_Control_Loop：读取成品反馈缓存，执行四路电机状态更新与原有闭环控制
 // 参数：无
 // 返回值：无
@@ -267,12 +399,13 @@ void Motor_Control_Loop(void)
 
         // SPI由独立采集任务执行，本函数不再等待ADC/SPI或操作传感器片选。
 
-        // 上位机再次写入模式6/7时，解除对应模式的三路超限锁定并重置导纳状态
+        // 上位机再次写入模式6/7时，解除对应模式的拇指/食指锁定，并清理顺序分配状态
         if ((admittance_mode_restart & MODE6_RESTART_FLAG) != 0U) {
             for (uint8_t i = 0U; i < TACTILE_FINGER_COUNT; i++) {
                 mode6_force_locked[i] = 0U;
                 Admittance_Reset(&adm_ctrl[i]);
             }
+            thumb_secondary_ready[0] = 0U;
             admittance_mode_restart &= (uint8_t)~MODE6_RESTART_FLAG;
         }
         if ((admittance_mode_restart & MODE7_RESTART_FLAG) != 0U) {
@@ -280,15 +413,29 @@ void Motor_Control_Loop(void)
                 mode7_force_locked[i] = 0U;
                 Admittance_Reset(&adm_ctrl[i]);
             }
+            thumb_secondary_ready[1] = 0U;
             admittance_mode_restart &= (uint8_t)~MODE7_RESTART_FLAG;
         }
+
+        // 模式6与7的退让单位不同，切换模式时清理共享积分与先后阶段，不继承另一模式的数值。
+        static uint8_t previous_mode = 0U;
+        if (mode != previous_mode) {
+            for (uint8_t channel = 0U; channel < TACTILE_FINGER_COUNT; channel++) {
+                Admittance_Reset(&adm_ctrl[channel]);
+            }
+            thumb_secondary_ready[0] = thumb_secondary_ready[1] = 0U;
+            previous_mode = mode;
+        }
+        float admittance_targets[Motor_Num] = {0.0f};
+        bool admittance_ready[Motor_Num] = {false};
+        Motor_PrepareAdmittanceTargets(mode, io_flag, &feedback, now_ms, adc_fresh,
+            admittance_targets, admittance_ready);
 
         /* 堵转保护状态 (跨调用保持) */
         static uint16_t stall_timer[Motor_Num] = {0};
         static float    stall_target[Motor_Num] = {0};
 
         for (int i = 0; i < Motor_Num; i++) {
-            int8_t tactile_index = Motor_GetTactileChannel((uint8_t)i);
             /* 2.1 状态采集 (已优化：单词读取 delta 确保速度/位置同步) */
             int16_t delta = (int16_t)__HAL_TIM_GET_COUNTER(motor_hw_map[i].enc_tim);
             __HAL_TIM_SET_COUNTER(motor_hw_map[i].enc_tim, 0);
@@ -303,18 +450,9 @@ void Motor_Control_Loop(void)
             motor[i].CurrentPosition = (float)ADC_HallValue[i];
 
             // 关节/导纳闭环不能用启动无数据或过期反馈驱动；保留目标和超限锁定等待恢复。
-            bool force_missing = (mode == 6U || mode == 7U) && tactile_index >= 0 &&
-                !SensorFeedback_IsFresh(feedback.force[tactile_index].valid,
-                    feedback.force[tactile_index].last_update_tick, now_ms);
-            if (((mode == 5U || mode == 7U) && !adc_fresh) || force_missing) {
-                motor[i].TargetSpeed = 0.0f;
-                PID_Position[i].Out_Last = 0.0f;
-                PID_Position[i].Error_Last1 = PID_Position[i].Error_Last2 = 0.0f;
-                PID_Angle[i].Out_Last = 0.0f;
-                PID_Angle[i].Error_Last1 = PID_Angle[i].Error_Last2 = 0.0f;
-                PID_Speed[i].Out_Last = 0.0f;
-                PID_Speed[i].Error_Last1 = PID_Speed[i].Error_Last2 = 0.0f;
-                Set_Motor((uint8_t)i, 0, 0);
+            if (((mode == 5U || mode == 7U) && !adc_fresh) ||
+                ((mode == 6U || mode == 7U) && !admittance_ready[i])) {
+                Motor_StopFeedbackControl((uint8_t)i);
                 continue;
             }
 
@@ -403,128 +541,20 @@ void Motor_Control_Loop(void)
                     if (motor[i].CurrentAngle < -60.0f * Real_OneTurn || motor[i].CurrentAngle > 60.0f * Real_OneTurn) motor[i].TargetSpeed = 0.0f;
                     break;
                 }
-                case 6: // 模式6：本板三指分别执行输出轴角度导纳控制
+                case 6: // 模式6：拇指顺序分配圈数退让，motor2无力反馈，食指独立导纳
                 {
-                    // 中指、无名指、小指使用各自的传感器和导纳控制器
-                    if (tactile_index >= 0) {
-                        if (mode6_force_locked[tactile_index] == 0U &&
-                            SensorFeedback_IsFresh(feedback.force[tactile_index].valid,
-                                feedback.force[tactile_index].last_update_tick, now_ms)) {
-                            // 使用本控制周期统一采集的力值，避免在导纳模式中重复进行SPI读取
-                            float force = feedback.force[tactile_index].f_sum;
-
-                            // 单指超过15N时只锁定该手指，并将其安全目标设为0圈
-                            if (force > TACTILE_FORCE_LIMIT_N) {
-                                mode6_force_locked[tactile_index] = 1U;
-                                Reg[i] = 0x0064U;
-                                Admittance_Reset(&adm_ctrl[tactile_index]);
-                            } else {
-                                // 基准圈数从对应寄存器高8位读出
-                                float base_turns = (float)(Reg[i] >> 8);
-                                adm_ctrl[tactile_index].B = (float)Reg[ADM_REG_DAMP] * 0.001f;
-                                adm_ctrl[tactile_index].K = (force > 0.1f)
-                            ? (float)Reg[ADM_REG_K] * 0.001f    // K_contact
-                            : (float)Reg[ADM_REG_B] * 0.001f;   // K_return
-                                float delta_turns = Admittance_Update(&adm_ctrl[tactile_index], force, 0.01f);
-                                motor[i].TargetAngle = Real_OneTurn * (base_turns - delta_turns);
-                                if (motor[i].TargetAngle > Real_OneTurn * 40.0f)
-                                    motor[i].TargetAngle = Real_OneTurn * 40.0f;
-                                if (motor[i].TargetAngle < -Real_OneTurn * 40.0f)
-                                    motor[i].TargetAngle = -Real_OneTurn * 40.0f;
-                            }
-                        }
-
-                        // 锁定期间维持0圈目标，直到上位机再次写入0x0601
-                        if (mode6_force_locked[tactile_index] != 0U) {
-                            motor[i].TargetAngle = 0.0f;
-                        }
-                    }
-
-                    // 未绑定触觉的motor0保留原目标，本板三指使用对应的新目标
+                    motor[i].TargetAngle = Real_OneTurn * admittance_targets[i];
                     motor[i].TargetSpeed = PID_Increment(&PID_Angle[i],
                         motor[i].CurrentAngle, motor[i].TargetAngle);
                     float max_spd = Real_MaxSpeed * (float)(Reg[i] & 0xFF);
-                    if (motor[i].TargetSpeed > max_spd)  motor[i].TargetSpeed = max_spd;
+                    if (motor[i].TargetSpeed > max_spd) motor[i].TargetSpeed = max_spd;
                     else if (motor[i].TargetSpeed < -max_spd) motor[i].TargetSpeed = -max_spd;
                     break;
                 }
-                case 7: // 模式7：本板三指分别执行关节角度导纳控制
+                case 7: // 模式7：统一目标已经完成共享退让分配，各关节仅执行自己的位置环
                 {
-                    // 中指、无名指、小指使用各自传感器，motor0执行普通位置控制
-                    if (tactile_index >= 0) {
-                        uint16_t base_tenths = 0U;
-                        if (!AngleCodec_DecodeBcdTenths(Reg[i], &base_tenths)) {
-                            motor[i].TargetSpeed = 0.0f;
-                            PID_Position[i].Out_Last = 0.0f;
-                            PID_Position[i].Error_Last1 = 0.0f;
-                            PID_Position[i].Error_Last2 = 0.0f;
-                            PID_Speed[i].Out_Last = 0.0f;
-                            PID_Speed[i].Error_Last1 = 0.0f;
-                            PID_Speed[i].Error_Last2 = 0.0f;
-                            Set_Motor(i, 0, 0); // 非法BCD立即停止，跳过本周期速度环
-                            continue;
-                        }
-
-                        if (mode7_force_locked[tactile_index] == 0U &&
-                            SensorFeedback_IsFresh(feedback.force[tactile_index].valid,
-                                feedback.force[tactile_index].last_update_tick, now_ms)) {
-                            // 使用本控制周期统一采集的力值，避免在导纳模式中重复进行SPI读取
-                            float force = feedback.force[tactile_index].f_sum;
-
-                            // 单指超过15N时只锁定该手指，并将其安全目标设为5.0°
-                            if (force > TACTILE_FORCE_LIMIT_N) {
-                                mode7_force_locked[tactile_index] = 1U;
-                                Reg[i] = 0x0050U;
-                                Admittance_Reset(&adm_ctrl[tactile_index]);
-                            } else {
-                                float base_angle = (float)base_tenths * 0.1f;
-                                if (base_angle < 5.0f) base_angle = 5.0f;
-                                if (base_angle > 90.0f) base_angle = 90.0f;
-
-                                adm_ctrl[tactile_index].x_max = 40.0f;
-                                adm_ctrl[tactile_index].B = (float)Reg[ADM_REG_DAMP] * 0.001f;
-                                adm_ctrl[tactile_index].K = (force > 0.1f)
-                                    ? (float)Reg[ADM_REG_K] * 0.001f
-                                    : (float)Reg[ADM_REG_B] * 0.001f;
-
-                                float delta_deg = Admittance_Update(&adm_ctrl[tactile_index], force, 0.01f);
-                                float target_angle = base_angle - delta_deg;
-                                if (target_angle < 5.0f) target_angle = 5.0f;
-                                if (target_angle > 90.0f) target_angle = 90.0f;
-                                motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i],
-                                    CalibrationLEN, target_angle, InterpolationFlag[i]);
-                            }
-                        }
-
-                        // 锁定期间持续执行5.0°安全目标，直到上位机再次写入0x0701
-                        if (mode7_force_locked[tactile_index] != 0U) {
-                            float target_angle = 5.0f;
-                            if (target_angle < 5.0f)  target_angle = 5.0f;
-                            if (target_angle > 90.0f) target_angle = 90.0f;
-                            motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i],
-                                CalibrationLEN, target_angle, InterpolationFlag[i]);
-                        }
-                    } else {
-                        // 未绑定触觉的motor0使用模式5逻辑，从四位压缩BCD读取目标角度
-                        uint16_t target_tenths = 0U;
-                        if (!AngleCodec_DecodeBcdTenths(Reg[i], &target_tenths)) {
-                            motor[i].TargetSpeed = 0.0f;
-                            PID_Position[i].Out_Last = 0.0f;
-                            PID_Position[i].Error_Last1 = 0.0f;
-                            PID_Position[i].Error_Last2 = 0.0f;
-                            PID_Speed[i].Out_Last = 0.0f;
-                            PID_Speed[i].Error_Last1 = 0.0f;
-                            PID_Speed[i].Error_Last2 = 0.0f;
-                            Set_Motor(i, 0, 0); // 非法BCD立即停止，跳过本周期速度环
-                            continue;
-                        }
-
-                        float target_angle = (float)target_tenths * 0.1f;
-                        if (target_angle < 5.0f)  target_angle = 5.0f;
-                        if (target_angle > 90.0f) target_angle = 90.0f;
-                        motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i],
-                            CalibrationLEN, target_angle, InterpolationFlag[i]);
-                    }
+                    motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i],
+                        CalibrationLEN, admittance_targets[i], InterpolationFlag[i]);
                     // 全电机位置环闭环 (ADC 反馈)
                     motor[i].TargetSpeed = PID_Increment(&PID_Position[i],
                         motor[i].CurrentPosition, motor[i].TargetPosition);
@@ -675,7 +705,7 @@ float PID_Increment(PID_Increment_Struct *PID, float Current, float Target)
 }
 
 // Print_Motor_Status：按指定格式输出电机、关节、触觉或 ADC 原始采样数据
-// 参数：motor_index - 电机索引，范围0～3，101仅支持有触觉传感器的1～3；param - 输出类型，1～5为现有状态，6为 ADC 原始值，101为关节角度、法向力与切向力之比、指尖合力数据帧
+// 参数：motor_index - 电机索引，范围0～3，101支持共用拇指传感器的0/1及食指3；param - 输出类型，1～5为现有状态，6为 ADC 原始值，101为关节角度、法向力与切向力之比、指尖合力数据帧
 // 返回值：无
 void Print_Motor_Status(uint8_t motor_index, uint8_t param)
 {
@@ -717,7 +747,7 @@ void Print_Motor_Status(uint8_t motor_index, uint8_t param)
         uint16_t adc_native = ADC_Snapshot[56U + motor_index];
         printf("%u\r\n", (unsigned int)adc_native);
     } else if (param == 101) {// 仅输出 FF、三个数值和 FE，以逗号分隔并换行结束
-        // motor0未绑定触觉，不输出提示文字，避免混入数据帧
+        // motor2未绑定触觉，不输出提示文字，避免混入数据帧
         if (tactile_index < 0) return;
 
         // 根据对应关节的零度与九十度标定值换算角度，并限制到0～90度
@@ -741,16 +771,13 @@ void Print_Motor_Status(uint8_t motor_index, uint8_t param)
     }
 }//用于调试，定期打印电机状态信息，观察 PID 收敛情况和系统响应特性
 
-// Motor_GetTactileChannel：从集中映射表查找指定电机对应的触觉缓存下标
-// 参数：motor_index - 原有电机编号0～3
-// 返回值：0～2表示触觉通道，-1表示本板未绑定
+// Motor_GetTactileChannel：把四路电机映射到两个物理力传感器
+// 参数：motor_index - 一号板电机编号0～3
+// 返回值：motor0/1返回共用通道0，motor3返回通道1，motor2或非法编号返回-1
 int8_t Motor_GetTactileChannel(uint8_t motor_index)
 {
-    for (uint8_t channel = 0U; channel < TACTILE_FINGER_COUNT; channel++) {
-        if (tactile_motor_indices[channel] == motor_index) {
-            return (int8_t)channel;
-        }
-    }
+    if (motor_index == 0U || motor_index == 1U) return 0;
+    if (motor_index == 3U) return 1;
     return -1;
 }
 

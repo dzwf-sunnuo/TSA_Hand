@@ -36,14 +36,14 @@ bool SensorFeedback_IsFresh(uint8_t valid, uint32_t update_ms, uint32_t now_ms)
     return valid != 0U && (uint32_t)(now_ms - update_ms) <= SENSOR_MAX_AGE_MS;
 }
 
-// SensorFeedback_Init：初始化PA8/PD1/PD2对应的中指、无名指、小指
+// SensorFeedback_Init：只初始化PA8/PD1对应的拇指、食指，不操作未使用的NSS3
 // 参数：无；须在TIM13启动后、RTOS调度前调用
 // 返回值：无；所有反馈最初均无效
 void SensorFeedback_Init(void)
 {
-    static GPIO_TypeDef *const ports[SENSOR_FORCE_COUNT] = {GPIOA, GPIOD, GPIOD};
-    static const uint16_t pins[SENSOR_FORCE_COUNT] = {GPIO_PIN_8, GPIO_PIN_1, GPIO_PIN_2};
-    static const char *const names[SENSOR_FORCE_COUNT] = {"Middle", "Ring", "Little"};
+    static GPIO_TypeDef *const ports[SENSOR_FORCE_COUNT] = {GPIOA, GPIOD};
+    static const uint16_t pins[SENSOR_FORCE_COUNT] = {GPIO_PIN_8, GPIO_PIN_1};
+    static const char *const names[SENSOR_FORCE_COUNT] = {"Thumb", "Index"};
     memset(&s_snapshot, 0, sizeof(s_snapshot));
     for (uint8_t i = 0U; i < SENSOR_FORCE_COUNT; i++) {
         (void)Tactile_Init(&s_sensors[i], &hspi3, ports[i], pins[i], names[i]);
@@ -66,7 +66,7 @@ void SensorFeedback_ReadSnapshot(SensorFeedbackSnapshot_t *snapshot)
     taskEXIT_CRITICAL();
     for (uint8_t i = 0U; i < SENSOR_FORCE_COUNT; i++) {
         // 即使采集任务尚未发布下一批，关闭采集也会立即撤销反馈有效位。
-        if ((enabled & (uint16_t)(1U << tactile_motor_indices[i])) == 0U) {
+        if ((enabled & tactile_enable_masks[i]) == 0U) {
             snapshot->force[i].valid = 0U;
         }
     }
@@ -173,7 +173,7 @@ static void SensorFeedback_ReadAdc(SensorFeedbackSnapshot_t *snapshot)
     snapshot->adc_valid = 1U;
 }
 
-// SensorFeedback_Acquire：在10毫秒周期内采集ADC并轮询启用的三个力传感器
+// SensorFeedback_Acquire：在10毫秒周期内采集ADC并轮询启用的两个力传感器
 // 参数：cycle_start_ms - 本周期实际开始的HAL时刻
 // 返回值：无；只在最后的短临界区发布缓存
 void SensorFeedback_Acquire(uint32_t cycle_start_ms)
@@ -187,7 +187,7 @@ void SensorFeedback_Acquire(uint32_t cycle_start_ms)
     for (uint8_t i = 0U; i < SENSOR_FORCE_COUNT; i++) {
         next.force[i].valid = 0U;
         uint32_t now_ms = HAL_GetTick();
-        if ((enabled & (uint16_t)(1U << tactile_motor_indices[i])) == 0U) {
+        if ((enabled & tactile_enable_masks[i]) == 0U) {
             s_retry_pending[i] = 0U; // 重新启用通道时立即尝试，不沿用先前的退避。
             continue;
         }
