@@ -46,11 +46,12 @@ extern "C" {
 
 /* Exported macro ------------------------------------------------------------*/
 /* USER CODE BEGIN EM */
-// 声明函数放在 CCMRAM (内核耦合内存 64KB @0x10000000, 零等待)
-// 数据用 .ccmram, 代码用 .ccmram.text, 避免 section type conflict
-// 启动代码会将代码从 Flash 自动复制到 CCMRAM
-#define __CCM_RAM_TEXT __attribute__((section(".ccmram.text")))   // 函数
-#define __CCM_RAM_DATA __attribute__((section(".ccmram")))        // 变量
+// CCMRAM为64KB CPU专用数据RAM，起址0x10000000；ADC/UART等DMA缓冲必须留在普通SRAM。
+// __CCM_RAM_DATA把全局或静态变量放入.ccmram，启动代码在进入main前从Flash复制初值。
+// 未显式初始化的变量也由该段的零初值镜像初始化；不需要在业务代码中另行清零。
+// 下方TEXT宏仅保留旧接口兼容：STM32F407的CCMRAM不能执行指令，禁止用于函数。
+#define __CCM_RAM_TEXT __attribute__((section(".ccmram.text")))   // 历史兼容定义，本项目不使用
+#define __CCM_RAM_DATA __attribute__((section(".ccmram")))        // 仅用于CPU访问的全局或静态数据
 /* USER CODE END EM */
 
 /* Exported functions prototypes ---------------------------------------------*/

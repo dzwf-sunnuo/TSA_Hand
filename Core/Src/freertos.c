@@ -53,26 +53,27 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-uint16_t ADC_NativeValue[60] = {0}; // 普通SRAM中的有限批次DMA缓冲，4通道各15点
+uint16_t ADC_NativeValue[60] = {0}; // DMA直接写入的60点原始缓冲，必须保留在普通SRAM，禁止迁入CCMRAM
 __CCM_RAM_DATA uint16_t ADC_Snapshot[60] = {0};    // 采集停止后由任务复制的稳定原始快照
 
-osMutexId_t xMotorDataMutexHandle;
+// 以下仅迁移CPU使用的对象句柄；对象本体的动态堆及DMA缓冲不改变位置。
+__CCM_RAM_DATA osMutexId_t xMotorDataMutexHandle;
 const osMutexAttr_t xMotorDataMutex_attributes = {
   .name = "xMotorDataMutex"
 };
-osSemaphoreId_t Sem_ADC_Done;  // DMA 单次采集完成信号
-osMessageQueueId_t modbusRxQueueHandle;
+__CCM_RAM_DATA osSemaphoreId_t Sem_ADC_Done;  // DMA 单次采集完成信号
+__CCM_RAM_DATA osMessageQueueId_t modbusRxQueueHandle;
 // UART 发送完成信号量（用于替换 busy-wait）
-osSemaphoreId_t uartTxSemHandle;
+__CCM_RAM_DATA osSemaphoreId_t uartTxSemHandle;
 
 // 1s 周期 Modbus 定时器（替代原先的累加计时方式）
-osTimerId_t modbus1sTimerHandle;
+__CCM_RAM_DATA osTimerId_t modbus1sTimerHandle;
 const osTimerAttr_t modbus1sTimer_attributes = {
   .name = "modbus1sTimer"
 };
 
 // LED 闪烁定时器 (RS485 收发触发双闪, 50ms 周期, 一次性)
-osTimerId_t ledBlinkTimerHandle;
+__CCM_RAM_DATA osTimerId_t ledBlinkTimerHandle;
 const osTimerAttr_t ledBlinkTimer_attributes = {
   .name = "ledBlinkTimer"
 };
@@ -86,10 +87,10 @@ const osTimerAttr_t ledBlinkTimer_attributes = {
 // CAN使用静态任务存储，不额外消耗已有15KB动态堆。
 __CCM_RAM_DATA static StaticTask_t canTelemetryTask_TCB;
 __CCM_RAM_DATA static StackType_t canTelemetryTask_Stack[512];
-osThreadId_t canTelemetryTaskHandle;
-volatile uint32_t sensorAcquisitionOverruns = 0U;
+__CCM_RAM_DATA osThreadId_t canTelemetryTaskHandle;
+__CCM_RAM_DATA volatile uint32_t sensorAcquisitionOverruns = 0U;
 
-osThreadId_t motorControlTaskHandle;
+__CCM_RAM_DATA osThreadId_t motorControlTaskHandle;
 __CCM_RAM_DATA static StaticTask_t motorControlTask_TCB;
 __CCM_RAM_DATA static StackType_t motorControlTask_Stack[512];  // 512 words = 2KB
 const osThreadAttr_t motorControlTask_attributes = {
@@ -97,21 +98,21 @@ const osThreadAttr_t motorControlTask_attributes = {
   .priority = (osPriority_t) osPriorityRealtime,
 };
 
-osThreadId_t modbusCommTaskHandle;
+__CCM_RAM_DATA osThreadId_t modbusCommTaskHandle;
 const osThreadAttr_t modbusCommTask_attributes = {
   .name = "modbusCommTask",
   .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
 
-osThreadId_t sensorProcessTaskHandle;
+__CCM_RAM_DATA osThreadId_t sensorProcessTaskHandle;
 const osThreadAttr_t sensorProcessTask_attributes = {
   .name = "sensorProcessTask",
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
-osThreadId_t systemMonitorTaskHandle;
+__CCM_RAM_DATA osThreadId_t systemMonitorTaskHandle;
 const osThreadAttr_t systemMonitorTask_attributes = {
   .name = "systemMonitorTask",
   .stack_size = 512 * 4,
@@ -222,6 +223,35 @@ void StartDefaultTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+// vApplicationGetIdleTaskMemory：覆盖CMSIS弱定义，为空闲任务提供CCMRAM静态存储
+// 参数：ppxIdleTaskTCBBuffer - 控制块输出；ppxIdleTaskStackBuffer - 栈地址输出；pulIdleTaskStackSize - 栈深输出（StackType_t个数）
+// 返回值：无；栈深保持configMINIMAL_STACK_SIZE，禁止将空闲任务栈用作DMA缓冲
+void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
+    StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize)
+{
+    __CCM_RAM_DATA static StaticTask_t idleTask_TCB;
+    __CCM_RAM_DATA static StackType_t idleTask_Stack[configMINIMAL_STACK_SIZE]
+        __attribute__((aligned(portBYTE_ALIGNMENT)));
+    *ppxIdleTaskTCBBuffer = &idleTask_TCB;
+    *ppxIdleTaskStackBuffer = idleTask_Stack;
+    *pulIdleTaskStackSize = (uint32_t)configMINIMAL_STACK_SIZE;
+}
+
+// vApplicationGetTimerTaskMemory：覆盖CMSIS弱定义，为软件定时器服务任务提供CCMRAM静态存储
+// 参数：ppxTimerTaskTCBBuffer - 控制块输出；ppxTimerTaskStackBuffer - 栈地址输出；pulTimerTaskStackSize - 栈深输出（StackType_t个数）
+// 返回值：无；现有定时器回调只访问CPU状态，栈深与优先级保持原配置，不把栈地址交给DMA
+void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer,
+    StackType_t **ppxTimerTaskStackBuffer, uint32_t *pulTimerTaskStackSize)
+{
+    __CCM_RAM_DATA static StaticTask_t timerTask_TCB;
+    __CCM_RAM_DATA static StackType_t timerTask_Stack[configTIMER_TASK_STACK_DEPTH]
+        __attribute__((aligned(portBYTE_ALIGNMENT)));
+    *ppxTimerTaskTCBBuffer = &timerTask_TCB;
+    *ppxTimerTaskStackBuffer = timerTask_Stack;
+    *pulTimerTaskStackSize = (uint32_t)configTIMER_TASK_STACK_DEPTH;
+}
+
 extern volatile uint8_t experiment_event;
 extern volatile uint8_t experiment_mode;
 extern volatile uint8_t experiment_output_limit;

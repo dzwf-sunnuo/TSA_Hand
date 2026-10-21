@@ -13,8 +13,8 @@
 
 extern ADC_HandleTypeDef hadc2;      // CubeMX 生成, 需重新生成代码
 
-static int pl_12v_state     = 1;     // 当前状态: 1=有电, 0=掉电
-static int pl_debounce_cnt  = 0;
+__CCM_RAM_DATA static int pl_12v_state = 1;     // 当前状态: 1=有电, 0=掉电
+__CCM_RAM_DATA static int pl_debounce_cnt = 0; // 仅CPU轮询更新的消抖状态
 
 // ================================================================
 //  初始化

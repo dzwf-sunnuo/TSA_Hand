@@ -67,7 +67,7 @@ PID_Increment_Struct PID_Speed[Motor_Num] __CCM_RAM_DATA = {0};    // 速度环 
 PID_Increment_Struct PID_Position[Motor_Num] __CCM_RAM_DATA = {0}; // 关节位置环 PID 状态
 PID_Increment_Struct PID_Angle[Motor_Num] __CCM_RAM_DATA = {0};    // 出轴角度环 PID 状态
 
-uint16_t ADC_HallValue[Hall_Num] = {0}; // 经过滤波后的 ADC 原始值
+__CCM_RAM_DATA uint16_t ADC_HallValue[Hall_Num] = {0}; // CPU使用的滤波结果，非DMA目标，放入CCMRAM
 
 /**
  * @brief 计算常数预推导，老电机要全部*20
@@ -284,8 +284,8 @@ void Motor_Control_Loop(void)
         }
 
         /* 堵转保护状态 (跨调用保持) */
-        static uint16_t stall_timer[Motor_Num] = {0};
-        static float    stall_target[Motor_Num] = {0};
+        __CCM_RAM_DATA static uint16_t stall_timer[Motor_Num] = {0}; // CPU控制状态，非DMA缓冲
+        __CCM_RAM_DATA static float stall_target[Motor_Num] = {0};
 
         for (int i = 0; i < Motor_Num; i++) {
             int8_t tactile_index = Motor_GetTactileChannel((uint8_t)i);

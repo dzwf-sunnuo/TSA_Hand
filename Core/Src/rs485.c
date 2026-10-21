@@ -8,13 +8,14 @@
 #include "task.h"
 #include "can_telemetry.h"
 
+// rcbuf由USART1 RX DMA直接写入，因此整个modbus结构体保留在普通SRAM，禁止加CCMRAM属性。
 MODBUS modbus;
-uint16_t Reg[100] __attribute__((section(".ccmram"))) = {0};
-volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[5..13] 时置 1
-volatile uint8_t admittance_mode_restart = 0; // bit0=模式6，bit1=模式7
-volatile uint8_t experiment_event = 0; // 1=实验开始，2=实验停止
-volatile uint8_t experiment_mode = 0;
-volatile uint8_t experiment_output_limit = 0;
+__CCM_RAM_DATA uint16_t Reg[100] = {0}; // CPU访问的保持寄存器，与DMA接收缓冲分开存放
+__CCM_RAM_DATA volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[5..13] 时置 1
+__CCM_RAM_DATA volatile uint8_t admittance_mode_restart = 0; // bit0=模式6，bit1=模式7
+__CCM_RAM_DATA volatile uint8_t experiment_event = 0; // 1=实验开始，2=实验停止
+__CCM_RAM_DATA volatile uint8_t experiment_mode = 0;
+__CCM_RAM_DATA volatile uint8_t experiment_output_limit = 0;
 
 #define EXPERIMENT_TARGET_TURNS 60U
 #define EXPERIMENT_RETURN_COMMAND 0x0064U
@@ -66,7 +67,7 @@ static void UpdateExperimentEvent(void)
 }
 
 // LED 闪烁状态 (RS485 收发时双闪)
-static int led_blink_cnt = 0;  // 剩余闪烁次数 (0=空闲)
+__CCM_RAM_DATA static int led_blink_cnt = 0;  // 剩余闪烁次数 (0=空闲)
 
 // LED 闪烁定时器回调: 每 100ms 翻转 PE2, 4 次 = 2 闪 (400ms)
 void LedBlinkTimerCallback(void *argument)

@@ -12,15 +12,16 @@
 #define CAN_MAILBOX_TIMEOUT_MS 5U
 #define CAN_INIT_RETRY_MS 1000U
 
-volatile CanTelemetryStats_t canTelemetryStats;
-static osThreadId_t s_task;
-static uint32_t s_pending_mask;
-static uint32_t s_pending_tick[3];
-static uint32_t s_last_init_tick;
-static uint8_t s_started;
-static uint8_t s_bus_off_seen;
-static uint8_t s_sequence;
-static uint16_t s_applied_frequency = CAN_REPORT_DEFAULT_FREQUENCY;
+// CAN邮箱时间、上报配置和统计均由CPU维护；HAL逐字写CAN寄存器，不通过DMA读取这些状态。
+__CCM_RAM_DATA volatile CanTelemetryStats_t canTelemetryStats;
+__CCM_RAM_DATA static osThreadId_t s_task;
+__CCM_RAM_DATA static uint32_t s_pending_mask;
+__CCM_RAM_DATA static uint32_t s_pending_tick[3];
+__CCM_RAM_DATA static uint32_t s_last_init_tick;
+__CCM_RAM_DATA static uint8_t s_started;
+__CCM_RAM_DATA static uint8_t s_bus_off_seen;
+__CCM_RAM_DATA static uint8_t s_sequence;
+__CCM_RAM_DATA static uint16_t s_applied_frequency = CAN_REPORT_DEFAULT_FREQUENCY;
 
 // CanTelemetry_ForceByte：将非负力量化到0.1牛顿并饱和到255
 // 参数：force - 牛顿值；非有限值由调用者通过有效位拒绝
