@@ -20,6 +20,7 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "adc.h"
+#include "can.h"
 #include "dma.h"
 #include "spi.h"
 #include "tim.h"
@@ -114,6 +115,7 @@ int main(void)
   MX_ADC2_Init();
   MX_SPI3_Init();
   MX_TIM13_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
   printf("(FreeRTOS Version)\r\n");
   Modbus_Init(); // Modbus 协议栈初始化

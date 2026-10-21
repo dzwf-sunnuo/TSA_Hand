@@ -27,8 +27,8 @@
 | 触觉接口 | SPI3：PC10/SCK、PC11/MISO、PC12/MOSI |
 | 触觉片选 | 食指 PA12、中指 PD1、无名指 PD2 |
 | 微秒延时 | TIM13，为触觉传感器 SPI 时序提供延时 |
-| 上位机通信 | USART1，RS485，Modbus RTU，115200 bit/s，8N1 |
-| 调试输出 | USART2，115200 bit/s |
+| 上位机通信 | USART1，RS485，Modbus RTU，230400 bit/s，8N1 |
+| 调试输出 | USART2，230400 bit/s |
 | Modbus 地址 | 由 `RS485_SLAVE_ADDR` 编译时配置；本文示例使用 `0x01` |
 | 支持功能码 | `0x03`、`0x06`、`0x10` |
 
@@ -134,7 +134,8 @@ SPI3 和 TIM13 在系统启动时完成初始化。触觉传感器也会在电�
 |---|---|---|---|
 | `vMotorControlTask` | Realtime | 10 ms | 四路电机闭环、触觉采样、导纳计算和 PWM 更新 |
 | `vModbusCommTask` | High | DMA + IDLE 事件驱动 | Modbus RTU 帧解析和寄存器读写 |
-| `vSensorProcessTask` | Normal | 20 ms | 四路 ADC 数据滤波 |
+| `vSensorProcessTask` | Normal | 10 ms | 四路ADC有限批次、三路SPI及反馈缓存发布 |
+| `vCanTelemetryTask` | BelowNormal | 默认50 ms | 两条CAN缓存反馈，频率由MODBUS配置 |
 | `vSystemMonitorTask` | Low | 20 ms | 通信超时、掉电保护、心跳和调试输出 |
 
 共享的电机状态与 Modbus 寄存器由 `xMotorDataMutex` 保护。
@@ -187,7 +188,7 @@ ctest --test-dir build/host-tests --output-on-failure
 
 ```bash
 pip install pyserial matplotlib numpy
-python tools/plot_motor_reduction_ratio.py COM8 115200 --motor 1 --degree 3
+python tools/plot_motor_reduction_ratio.py COM8 230400 --motor 1 --degree 3
 ```
 
 默认串口为`COM8`，默认采用三次多项式，可通过`--degree 1～5`选择其他阶数。按`Ctrl+C`或关闭图表窗口停止采集，脚本会在`logs/`目录保存原始CSV、PNG图表和拟合结果TXT。
@@ -224,13 +225,13 @@ EXPERIMENT_START,电机编号,输出限幅百分比,模式
 | 100% | `0x3C64` | `0x0064` |
 
 ```bash
-python tools/多速度减速比数据采集.py COM8 115200
+python tools/多速度减速比数据采集.py COM8 230400
 ```
 
 也可以自定义要比较的限幅和拟合阶数：
 
 ```bash
-python tools/多速度减速比数据采集.py COM8 115200 --limits 20,40,60,80,100 --degree 3
+python tools/多速度减速比数据采集.py COM8 230400 --limits 20,40,60,80,100 --degree 3
 ```
 
 每次收到新的开始标志都会建立独立实验段，并以该段第一条有效数据作为相对零点。第五档返回零点后脚本自动结束，也可以提前按`Ctrl+C`停止。输出包括原始数据CSV、指标汇总CSV、分析报告TXT、综合对比PNG，以及把五档局部减速比叠加在同一坐标系中的`五档速度减速比曲线_时间.png`。
@@ -246,3 +247,5 @@ python tools/多速度减速比数据采集.py COM8 115200 --limits 20,40,60,80,
 7. 测试结束后将 `Reg[4]` 写为 `0x0000`。
 
 首次联调前请完整阅读 [导纳控制上位机指令说明](docs/Admittance_Control_Protocol.md)，并确保机构留有足够的安全行程。
+
+CAN角度/力上报及Reg[18..20]配置见[CAN反馈协议](docs/CAN_Telemetry_Protocol.md)。用户已确认本次实现编译通过；真机验证状态尚未确认。

@@ -9,10 +9,10 @@
 //#define RS485_TX_ENABLE  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET)   // 1，发送
 //#define RS485_RX_ENABLE  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET) // 0，接收
 
-#define MODBUS_BUF_SIZE 100
+#define MODBUS_BUF_SIZE 200
 #define MODBUS_RX_QUEUE_LENGTH 4
 
-#define RS485_SLAVE_ADDR 0x01 // 从机地址（可根据需要修改）
+#define RS485_SLAVE_ADDR 0x02 // 从机地址（可根据需要修改）
 
 // LED 闪烁参数: 4 次翻转 = 2 闪, 总时长 = BLINK_PERIOD × 4
 #define LED_BLINK_PERIOD_MS  50U
@@ -32,6 +32,24 @@
 #define ADM_REG_K  15    // 接触刚度 ×1000
 #define ADM_REG_B  16    // 回弹刚度 ×1000
 #define ADM_REG_DAMP 17  // 虚拟阻尼 ×1000 (16=0.016, 越小响应越快)
+
+// SPI采集位按实际电机编号定义：bit1/2/3分别为中指/无名指/小指。
+// bit0及其他位不绑定传感器，采集开关不控制电机运动使能。
+#define TACTILE_REG_ENABLE 18U
+#define TACTILE_DEFAULT_ENABLE 0x000EU
+
+// CAN统一开关只允许0/1；频率单位Hz，两条反馈共用，复位恢复默认。
+#define CAN_REPORT_REG_ENABLE 19U
+#define CAN_REPORT_REG_FREQUENCY 20U
+#define CAN_REPORT_DEFAULT_ENABLE 1U
+#define CAN_REPORT_DEFAULT_FREQUENCY 20U
+#define CAN_REPORT_MIN_FREQUENCY 1U
+#define CAN_REPORT_MAX_FREQUENCY 100U
+
+// Modbus_GetCanReportConfig：原子复制两个上报寄存器并防御非法内存值
+// 参数：enabled - 开关输出；frequency - Hz输出，地址不可为空
+// 返回值：无；正常值直接反映寄存器内容
+void Modbus_GetCanReportConfig(uint16_t *enabled, uint16_t *frequency);
 
 typedef struct
 {

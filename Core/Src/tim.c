@@ -425,7 +425,9 @@ void MX_TIM8_Init(void)
   /* USER CODE END TIM8_Init 2 */
 
 }
-/* TIM13 init function */
+// MX_TIM13_Init：配置真实1微秒的自由运行时基，供SPI协议延时使用
+// 参数：无
+// 返回值：无
 void MX_TIM13_Init(void)
 {
 
@@ -437,7 +439,7 @@ void MX_TIM13_Init(void)
 
   /* USER CODE END TIM13_Init 1 */
   htim13.Instance = TIM13;
-  htim13.Init.Prescaler = 41;
+  htim13.Init.Prescaler = 83; // TIM13输入84MHz，除以84后为1MHz
   htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim13.Init.Period = 65535;
   htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;

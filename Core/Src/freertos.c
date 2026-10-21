@@ -32,6 +32,8 @@
 #include "stdio.h"
 #include <string.h>
 #include <stdint.h>
+#include "sensor_feedback.h"
+#include "can_telemetry.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,8 +53,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-uint16_t ADC_NativeValue[60] = {0}; // DMA 目标缓冲区 (4ch × 15样本)
-__CCM_RAM_DATA uint16_t ADC_Snapshot[60] = {0};    // 完成回调中拷贝的快照
+uint16_t ADC_NativeValue[60] = {0}; // 普通SRAM中的有限批次DMA缓冲，4通道各15点
+__CCM_RAM_DATA uint16_t ADC_Snapshot[60] = {0};    // 采集停止后由任务复制的稳定原始快照
 
 osMutexId_t xMotorDataMutexHandle;
 const osMutexAttr_t xMotorDataMutex_attributes = {
@@ -80,6 +82,12 @@ const osTimerAttr_t ledBlinkTimer_attributes = {
 // const osTimerAttr_t powerLossInitTimer_attributes = {
 //   .name = "powerLossInitTimer"
 // };
+
+// CAN使用静态任务存储，不额外消耗已有15KB动态堆。
+__CCM_RAM_DATA static StaticTask_t canTelemetryTask_TCB;
+__CCM_RAM_DATA static StackType_t canTelemetryTask_Stack[512];
+osThreadId_t canTelemetryTaskHandle;
+volatile uint32_t sensorAcquisitionOverruns = 0U;
 
 osThreadId_t motorControlTaskHandle;
 __CCM_RAM_DATA static StaticTask_t motorControlTask_TCB;
@@ -137,6 +145,9 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
   * @param  None
   * @retval None
   */
+// MX_FREERTOS_Init：创建现有控制任务与静态CAN反馈任务及同步对象
+// 参数：无
+// 返回值：无
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
 
@@ -174,6 +185,9 @@ void MX_FREERTOS_Init(void) {
   modbusCommTaskHandle    = osThreadNew(vModbusCommTask, NULL, &modbusCommTask_attributes);
   sensorProcessTaskHandle = osThreadNew(vSensorProcessTask, NULL, &sensorProcessTask_attributes);
   systemMonitorTaskHandle = osThreadNew(vSystemMonitorTask, NULL, &systemMonitorTask_attributes);
+  canTelemetryTaskHandle = (osThreadId_t)xTaskCreateStatic(
+      vCanTelemetryTask, "canTelemetry", 512, NULL,
+      osPriorityBelowNormal, canTelemetryTask_Stack, &canTelemetryTask_TCB);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -211,26 +225,24 @@ void StartDefaultTask(void *argument)
 extern volatile uint8_t experiment_event;
 extern volatile uint8_t experiment_mode;
 extern volatile uint8_t experiment_output_limit;
-/**
-  * @brief 电机控制任务 (最高实时优先级)
-  * @param argument: 未使用
-  * @retval None
-  * @note 绝对的 10ms 周期执行闭环 PID 计算
-  */
+// vMotorControlTask：按累计绝对截止时间运行100Hz控制，不等待传感器采集
+// 参数：argument - 未使用
+// 返回值：无，持续运行；超期跳过旧周期，不突发补算
 void vMotorControlTask(void *argument)
 {
-  uint32_t PreviousWakeTime = osKernelGetTickCount();
-  for(;;)
-  {
-    // 绝对延时周期 (由 CONTROL_FREQ_HZ 决定), 确保控制环路稳定
-    osDelayUntil(PreviousWakeTime + CONTROL_PERIOD_TICKS);
-    PreviousWakeTime = osKernelGetTickCount();
-
-    // 获取互斥锁，保护串口指令与本地闭环计算的数据安全
+  (void)argument;
+  uint32_t next_tick = osKernelGetTickCount() + CONTROL_PERIOD_TICKS;
+  for (;;) {
+    osDelayUntil(next_tick);
+    next_tick += CONTROL_PERIOD_TICKS;
     if (xMotorDataMutexHandle != NULL) {
       osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
-      Motor_Control_Loop(); // 执行电机位置/速度内环闭环计算并输出PWM
+      Motor_Control_Loop();
       osMutexRelease(xMotorDataMutexHandle);
+    }
+    uint32_t now_tick = osKernelGetTickCount();
+    if ((int32_t)(now_tick - next_tick) >= 0) {
+      next_tick += ((now_tick - next_tick) / CONTROL_PERIOD_TICKS + 1U) * CONTROL_PERIOD_TICKS;
     }
   }
 }
@@ -241,8 +253,12 @@ void vMotorControlTask(void *argument)
   * @retval None
   * @note 等待串口接收中断通过消息队列传递来的 Modbus 帧，解析后更新寄存器或执行相应操作
   */
+// vModbusCommTask：串行处理完整MODBUS帧，寄存器由协议函数原子提交
+// 参数：argument - 未使用
+// 返回值：无，持续处理请求
 void vModbusCommTask(void *argument)
 {
+  (void)argument;
   MODBUS_FrameTypeDef frame;
 
   for(;;)
@@ -259,65 +275,29 @@ void vModbusCommTask(void *argument)
         continue;// 如果接收到的帧长度超过缓冲区大小，丢弃该帧
       }
 
-      if (xMotorDataMutexHandle != NULL) {
-        if (osMutexAcquire(xMotorDataMutexHandle, 10) == osOK) { // 尝试拿锁，超时 10ms
-          Modbus_Event(&frame); 
-          osMutexRelease(xMotorDataMutexHandle);
-        }
-      }
+      // 寄存器由协议函数短临界区原子提交，串口发送等待不再占用电机锁。
+      Modbus_Event(&frame);
     }
   }
 }
 
-/**
- * @brief 传感器处理任务 (普通优先级)
- *
- * 每 10ms 启动一次 ADC DMA 单次采集 (4 通道 × 15 样本),
- * DMA 正常模式: 传输完成自动停止, ISR 快照 → 滑动窗口均值滤波 → 写入 ADC_HallValue[],
- * 最后调用 Stop_DMA 为下一轮准备干净状态。
- */
+// vSensorProcessTask：每10毫秒完成一批ADC与三路SPI并发布完整缓存
+// 参数：argument - 未使用
+// 返回值：无；绝对周期累计调度，超期计数并跳过旧周期
 void vSensorProcessTask(void *argument)
 {
-  uint16_t local[60];
-  uint8_t i, j;
-  uint32_t sum;
-
-  for(;;)
-  {
-    // 启动单次 DMA 采集 (4 通道 × 15 样本)
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)ADC_NativeValue, 60);
-
-    // 等待 DMA 完成 (超时 50ms 为安全兜底)
-    if (osSemaphoreAcquire(Sem_ADC_Done, 50) != osOK) {
-      HAL_ADC_Stop_DMA(&hadc1);
-      continue;
+  (void)argument;
+  const uint32_t period_ticks = osKernelGetTickFreq() / SENSOR_ACQUISITION_HZ;
+  uint32_t next_tick = osKernelGetTickCount();
+  for (;;) {
+    SensorFeedback_Acquire(HAL_GetTick());
+    next_tick += period_ticks;
+    uint32_t now_tick = osKernelGetTickCount();
+    if ((int32_t)(now_tick - next_tick) >= 0) {
+      sensorAcquisitionOverruns++;
+      next_tick += ((now_tick - next_tick) / period_ticks + 1U) * period_ticks;
     }
-
-    // 拷贝快照到本地栈
-    for (i = 0; i < 60; i++) {
-      local[i] = ADC_Snapshot[i];
-    }
-
-    // 滑动窗口均值: 每通道 15 样本直接求和取平均
-    // 加锁写入, 保证控制任务和监控任务读到一致的 ADC_HallValue[]
-    if (xMotorDataMutexHandle != NULL) {
-      osMutexAcquire(xMotorDataMutexHandle, osWaitForever);
-    }
-    for (j = 0; j < 4; j++) {
-      sum = 0;
-      for (i = 0; i < 15; i++) {
-        sum += local[4 * i + j];
-      }
-      ADC_HallValue[j] = (uint16_t)(sum / 15);
-    }
-    if (xMotorDataMutexHandle != NULL) {
-      osMutexRelease(xMotorDataMutexHandle);
-    }
-
-    // 停止 ADC + DMA, 为下一轮 Start_DMA 准备干净的状态
-    HAL_ADC_Stop_DMA(&hadc1);
-
-    osDelay(10);  // 10ms 后进入下一轮采集
+    osDelayUntil(next_tick);
   }
 }
 
@@ -335,7 +315,7 @@ void vSystemMonitorTask(void *argument)
   for(;;)
   {
     // 100ms周期监控，同时输出减速比实验CSV数据
-    osDelayUntil(PreviousWakeTime + 100);
+    osDelayUntil(PreviousWakeTime + 250);
     PreviousWakeTime = osKernelGetTickCount();
 
     // 12V 主电掉电检测 (ADC2 IN4, 100ms 轮询 + 2 次消抖 = 200ms)
@@ -353,7 +333,7 @@ void vSystemMonitorTask(void *argument)
       pl_was_lost = 0;
     }
       // 先输出实验事件，再输出同周期数据，便于上位机准确切分采集区间
-      if (experiment_event == 1U) {
+      /*if (experiment_event == 1U) {
         printf("EXPERIMENT_START,1,%u,%u\r\n",
                (unsigned int)experiment_output_limit,
                (unsigned int)experiment_mode);
@@ -361,8 +341,8 @@ void vSystemMonitorTask(void *argument)
       } else if (experiment_event == 2U) {
         printf("EXPERIMENT_STOP\r\n");
         experiment_event = 0U;
-      }
-      Print_Motor_Status(0, 5); // 输出食指：电机编号,电机累计圈数,关节角度
+      }*/
+      Print_Motor_Status(tactile_motor_indices[0], 101); // 默认输出中指motor1的FF数据帧
     }
 
   }
@@ -391,21 +371,20 @@ void Modbus1sTimerCallback(void *argument)
     // 功能被禁用 -- 原实现已注释
   }
 
-/**
- * @brief ADC DMA 传输完成回调 — 快照 + 信号量唤醒
- *
- * DMA 正常模式 (非循环), 完成 60 次半字传输后硬件自动停止。
- * 此时 ADC_NativeValue[] 已稳定, 拷贝到 ADC_Snapshot(CCM) 无竞态。
- * 频率 = 任务频率 (10ms → 100 Hz), 不会淹没调度器。
- */
+// HAL_ADC_ConvCpltCallback：在DMA满块时立即冻结ADC，再通知采集任务
+// 参数：hadc - 完成转换的ADC句柄，仅处理ADC1
+// 返回值：无；不在中断里复制缓冲或进行滤波
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    if (hadc->Instance != ADC1) return;
+    if (hadc->Instance == ADC1) SensorFeedback_AdcFinishedFromISR(1U);
+}
 
-    for (int i = 0; i < 60; i++) {
-        ADC_Snapshot[i] = ADC_NativeValue[i];
-    }
-    osSemaphoreRelease(Sem_ADC_Done);
+// HAL_ADC_ErrorCallback：结束错误批次并唤醒任务执行有界恢复
+// 参数：hadc - 报错的ADC句柄，ADC2掉电检测维持原逻辑
+// 返回值：无
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1) SensorFeedback_AdcFinishedFromISR(0U);
 }
 
 /* USER CODE END Application */

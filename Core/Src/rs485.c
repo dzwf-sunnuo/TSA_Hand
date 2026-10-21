@@ -5,6 +5,8 @@
 #include "cmsis_os.h"
 #include "FreeRTOS.h"
 #include "timers.h"
+#include "task.h"
+#include "can_telemetry.h"
 
 MODBUS modbus;
 uint16_t Reg[100] __attribute__((section(".ccmram"))) = {0};
@@ -91,10 +93,10 @@ void Modbus_Send_Byte(uint8_t ch)
     }
 }
 
-/**
- * @brief Modbus 初始化
- */
-void Modbus_Init()
+// Modbus_Init：初始化协议、三指采集使能与默认20Hz的CAN自动上报
+// 参数：无
+// 返回值：无
+void Modbus_Init(void)
 {
     memset(&modbus, 0, sizeof(MODBUS));
     
@@ -104,6 +106,11 @@ void Modbus_Init()
     Reg[2] = 0x0000; 
     Reg[3] = 0x0000; 
     Reg[4] = 0x0000; 
+
+    // 三路采集与CAN上报均默认开启，电机运动使能仍由Reg[4]独立控制。
+    Reg[TACTILE_REG_ENABLE] = TACTILE_DEFAULT_ENABLE;
+    Reg[CAN_REPORT_REG_ENABLE] = CAN_REPORT_DEFAULT_ENABLE;
+    Reg[CAN_REPORT_REG_FREQUENCY] = CAN_REPORT_DEFAULT_FREQUENCY;
 
     modbus.myadd = RS485_SLAVE_ADDR;    
     
@@ -241,133 +248,172 @@ void Modbus_Event(const MODBUS_FrameTypeDef *frame)
     }
 }
 
-/**
- * @brief 03 功能码处理：读取寄存器
- */
+// Modbus_GetCanReportConfig：原子读取公共开关和频率，避免多寄存器更新中途取值
+// 参数：enabled - 开关输出地址；frequency - 频率输出地址
+// 返回值：无；不等待电机互斥锁
+void Modbus_GetCanReportConfig(uint16_t *enabled, uint16_t *frequency)
+{
+    if (enabled == NULL || frequency == NULL) return;
+    taskENTER_CRITICAL();
+    *enabled = Reg[CAN_REPORT_REG_ENABLE] == 1U ? 1U : 0U;
+    *frequency = Reg[CAN_REPORT_REG_FREQUENCY];
+    taskEXIT_CRITICAL();
+    if (*frequency < CAN_REPORT_MIN_FREQUENCY || *frequency > CAN_REPORT_MAX_FREQUENCY) {
+        *frequency = CAN_REPORT_DEFAULT_FREQUENCY;
+    }
+}
+
+// Modbus_CanValueValid：仅校验新增寄存器，保留其他寄存器原有值域
+// 参数：address - 寄存器地址；value - 准备写入的值
+// 返回值：1表示允许，0表示新增配置值非法
+static uint8_t Modbus_CanValueValid(uint16_t address, uint16_t value)
+{
+    if (address == CAN_REPORT_REG_ENABLE) return value <= 1U;
+    if (address == CAN_REPORT_REG_FREQUENCY) {
+        return value >= CAN_REPORT_MIN_FREQUENCY && value <= CAN_REPORT_MAX_FREQUENCY;
+    }
+    return 1U;
+}
+
+// Modbus_SendResponse：沿用项目现有CRC编码和USART1发送完成通知
+// 参数：body_length - 已写入sendbuf的响应正文长度，不含CRC
+// 返回值：无；等待串口时不持有电机寄存器锁或临界区
+static void Modbus_SendResponse(uint16_t body_length)
+{
+    uint16_t crc = Modbus_CRC16(modbus.sendbuf, body_length);
+    modbus.sendbuf[body_length++] = (uint8_t)(crc >> 8);
+    modbus.sendbuf[body_length++] = (uint8_t)crc;
+    if (uartTxSemHandle != NULL) {
+        while (osSemaphoreAcquire(uartTxSemHandle, 0U) == osOK) {
+        }
+    }
+    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, body_length) == HAL_OK &&
+        uartTxSemHandle != NULL) {
+        (void)osSemaphoreAcquire(uartTxSemHandle, 100U);
+    }
+}
+
+// Modbus_SendException：对单播非法地址或非法值返回异常，广播保持静默
+// 参数：buffer - 原请求；exception - 0x02非法地址或0x03非法数据值
+// 返回值：无
+static void Modbus_SendException(const uint8_t *buffer, uint8_t exception)
+{
+    if (buffer[0] == 0U) return;
+    modbus.sendbuf[0] = modbus.myadd;
+    modbus.sendbuf[1] = buffer[1] | 0x80U;
+    modbus.sendbuf[2] = exception;
+    Modbus_SendResponse(3U);
+}
+
+// Modbus_AfterWrite：在原子写入完成后处理PID、模式与实验事件
+// 参数：address - 起始地址；count - 寄存器数量
+// 返回值：无；调用者仍在短临界区中，函数不等待任何硬件
+static void Modbus_AfterWrite(uint16_t address, uint16_t count)
+{
+    uint16_t end = address + count;
+    if (address <= PID_REG_KD_SPD && end > PID_REG_KP_POS) pid_params_dirty = 1U;
+    if (address <= 4U && end > 4U) UpdateAdmittanceRestartFlag(Reg[4]);
+    if (address == 0U || (address <= 4U && end > 4U)) UpdateExperimentEvent();
+}
+
+// Modbus_Func3：读取保持寄存器，并限制响应长度以保护200字节发送缓冲
+// 参数：buffer - 完整且CRC正确的请求；length - 实际帧长
+// 返回值：无；广播读取不响应
 void Modbus_Func3(const uint8_t *buffer, uint16_t length)
 {
-    uint16_t Regadd, Reglen, crc;
-    uint16_t i, send_len = 0;
-
-    if (buffer == NULL || length < 8U)
-    {
+    if (buffer == NULL || length != 8U || buffer[0] == 0U) return;
+    uint16_t address = (uint16_t)((buffer[2] << 8) | buffer[3]);
+    uint16_t count = (uint16_t)((buffer[4] << 8) | buffer[5]);
+    if (count == 0U || count > (MODBUS_BUF_SIZE - 5U) / 2U) {
+        Modbus_SendException(buffer, 0x03U);
         return;
     }
-
-    Regadd = (uint16_t)(buffer[2] * 256U + buffer[3]);
-    Reglen = (uint16_t)(buffer[4] * 256U + buffer[5]);
-
-    if (Regadd + Reglen > 100) return;
-
-    modbus.sendbuf[send_len++] = modbus.myadd;
-    modbus.sendbuf[send_len++] = 0x03;
-    modbus.sendbuf[send_len++] = (uint8_t)(Reglen * 2);
-
-    for (i = 0; i < Reglen; i++)
-    {
-        modbus.sendbuf[send_len++] = Reg[Regadd + i] >> 8;
-        modbus.sendbuf[send_len++] = Reg[Regadd + i] & 0xFF;
+    if (address >= 100U || (uint32_t)address + count > 100U) {
+        Modbus_SendException(buffer, 0x02U);
+        return;
     }
-
-    crc = Modbus_CRC16(modbus.sendbuf, send_len);
-    modbus.sendbuf[send_len++] = crc >> 8;
-    modbus.sendbuf[send_len++] = crc & 0xFF;
-
-    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, send_len) == HAL_OK) {
-        if (uartTxSemHandle != NULL) {
-            (void)osSemaphoreAcquire(uartTxSemHandle, 100); // 等待完成
-        }
+    modbus.sendbuf[0] = modbus.myadd;
+    modbus.sendbuf[1] = 0x03U;
+    modbus.sendbuf[2] = (uint8_t)(2U * count);
+    taskENTER_CRITICAL();
+    for (uint16_t i = 0U; i < count; i++) {
+        uint16_t value = Reg[address + i];
+        modbus.sendbuf[3U + 2U * i] = (uint8_t)(value >> 8);
+        modbus.sendbuf[4U + 2U * i] = (uint8_t)value;
     }
+    taskEXIT_CRITICAL();
+    Modbus_SendResponse((uint16_t)(3U + 2U * count));
 }
 
-/**
- * @brief 06 功能码处理：写单个寄存器
- */
+// Modbus_Func6：校验后原子写入单寄存器，实际配置变化才通知CAN任务
+// 参数：buffer - 完整且CRC正确的请求；length - 实际帧长
+// 返回值：无；非法写入保持旧值，广播合法写入但不回包
 void Modbus_Func6(const uint8_t *buffer, uint16_t length)
 {
-    uint16_t Regadd, val, crc;
-    uint16_t send_len = 0;
-
-    if (buffer == NULL || length < 8U)
-    {
+    if (buffer == NULL || length != 8U) return;
+    uint16_t address = (uint16_t)((buffer[2] << 8) | buffer[3]);
+    uint16_t value = (uint16_t)((buffer[4] << 8) | buffer[5]);
+    if (address >= 100U) {
+        Modbus_SendException(buffer, 0x02U);
         return;
     }
-
-    Regadd = (uint16_t)(buffer[2] * 256U + buffer[3]);
-    val = (uint16_t)(buffer[4] * 256U + buffer[5]);
-
-    if (Regadd >= 100) return;
-
-    Reg[Regadd] = val;
-    if (Regadd >= PID_REG_KP_POS && Regadd <= PID_REG_KD_SPD) pid_params_dirty = 1;
-    if (Regadd == 4U) {
-        UpdateAdmittanceRestartFlag(val);
+    if (Modbus_CanValueValid(address, value) == 0U) {
+        Modbus_SendException(buffer, 0x03U);
+        return;
     }
-    if (Regadd == 0U || Regadd == 4U) UpdateExperimentEvent();
-
-    modbus.sendbuf[send_len++] = modbus.myadd;
-    modbus.sendbuf[send_len++] = 0x06;
-    modbus.sendbuf[send_len++] = Regadd >> 8;
-    modbus.sendbuf[send_len++] = Regadd & 0xFF;
-    modbus.sendbuf[send_len++] = val >> 8;
-    modbus.sendbuf[send_len++] = val & 0xFF;
-
-    crc = Modbus_CRC16(modbus.sendbuf, send_len);
-    modbus.sendbuf[send_len++] = crc >> 8;
-    modbus.sendbuf[send_len++] = crc & 0xFF;
-
-    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, send_len) == HAL_OK) {
-        if (uartTxSemHandle != NULL) {
-            (void)osSemaphoreAcquire(uartTxSemHandle, 100);
-        }
+    taskENTER_CRITICAL();
+    uint8_t changed = (address == CAN_REPORT_REG_ENABLE || address == CAN_REPORT_REG_FREQUENCY) &&
+                       Reg[address] != value;
+    Reg[address] = value;
+    Modbus_AfterWrite(address, 1U);
+    taskEXIT_CRITICAL();
+    if (changed != 0U) CanTelemetry_NotifyConfigChanged();
+    if (buffer[0] != 0U) {
+        memcpy(modbus.sendbuf, buffer, 6U);
+        Modbus_SendResponse(6U);
     }
 }
 
-/**
- * @brief 16 功能码处理：写多个寄存器
- */
+// Modbus_Func16：完整校验多寄存器请求后一次提交，拒绝半成功状态
+// 参数：buffer - 完整且CRC正确的请求；length - 实际帧长
+// 返回值：无；所有格式和值校验在写入和模式副作用之前完成
 void Modbus_Func16(const uint8_t *buffer, uint16_t length)
 {
-    uint16_t Regadd, Reglen, crc;
-    uint16_t i, send_len = 0;
-
-    if (buffer == NULL || length < 9U)
-    {
+    if (buffer == NULL || length < 9U) return;
+    uint16_t address = (uint16_t)((buffer[2] << 8) | buffer[3]);
+    uint16_t count = (uint16_t)((buffer[4] << 8) | buffer[5]);
+    if (count == 0U || count > (MODBUS_BUF_SIZE - 9U) / 2U ||
+        buffer[6] != 2U * count || length != 9U + 2U * count) {
+        Modbus_SendException(buffer, 0x03U);
         return;
     }
-
-    Regadd = (uint16_t)(buffer[2] * 256U + buffer[3]);
-    Reglen = (uint16_t)(buffer[4] * 256U + buffer[5]);
-
-    if (Regadd + Reglen > 100) return;
-
-    for (i = 0; i < Reglen; i++)
-    {
-        Reg[Regadd + i] = (uint16_t)(buffer[7 + i * 2] * 256U + buffer[8 + i * 2]);
+    if (address >= 100U || (uint32_t)address + count > 100U) {
+        Modbus_SendException(buffer, 0x02U);
+        return;
     }
-    if (Regadd <= 4U && (Regadd + Reglen) > 4U) {
-        UpdateAdmittanceRestartFlag(Reg[4]);
-    }
-    if (Regadd == 0U || (Regadd <= 4U && (Regadd + Reglen) > 4U))
-        UpdateExperimentEvent();
-    // 如果本次写入的寄存器区间与 PID 参数区间 [5,13] 有重叠, 打上脏标记
-    if (Regadd <= PID_REG_KD_SPD && (Regadd + Reglen) > PID_REG_KP_POS)
-        pid_params_dirty = 1;
-
-    modbus.sendbuf[send_len++] = modbus.myadd;
-    modbus.sendbuf[send_len++] = 0x10;
-    modbus.sendbuf[send_len++] = Regadd >> 8;
-    modbus.sendbuf[send_len++] = Regadd & 0xFF;
-    modbus.sendbuf[send_len++] = Reglen >> 8;
-    modbus.sendbuf[send_len++] = Reglen & 0xFF;
-
-    crc = Modbus_CRC16(modbus.sendbuf, send_len);
-    modbus.sendbuf[send_len++] = crc >> 8;
-    modbus.sendbuf[send_len++] = crc & 0xFF;
-
-    if (HAL_UART_Transmit_IT(&huart1, modbus.sendbuf, send_len) == HAL_OK) {
-        if (uartTxSemHandle != NULL) {
-            (void)osSemaphoreAcquire(uartTxSemHandle, 100);
+    for (uint16_t i = 0U; i < count; i++) {
+        uint16_t value = (uint16_t)((buffer[7U + 2U * i] << 8) | buffer[8U + 2U * i]);
+        if (Modbus_CanValueValid(address + i, value) == 0U) {
+            Modbus_SendException(buffer, 0x03U);
+            return;
         }
+    }
+    uint8_t changed = 0U;
+    taskENTER_CRITICAL();
+    for (uint16_t i = 0U; i < count; i++) {
+        uint16_t current = address + i;
+        uint16_t value = (uint16_t)((buffer[7U + 2U * i] << 8) | buffer[8U + 2U * i]);
+        if ((current == CAN_REPORT_REG_ENABLE || current == CAN_REPORT_REG_FREQUENCY) &&
+            Reg[current] != value) changed = 1U;
+        Reg[current] = value;
+    }
+    Modbus_AfterWrite(address, count);
+    taskEXIT_CRITICAL();
+    if (changed != 0U) CanTelemetry_NotifyConfigChanged();
+    if (buffer[0] != 0U) {
+        modbus.sendbuf[0] = modbus.myadd;
+        modbus.sendbuf[1] = 0x10U;
+        memcpy(&modbus.sendbuf[2], &buffer[2], 4U);
+        Modbus_SendResponse(6U);
     }
 }

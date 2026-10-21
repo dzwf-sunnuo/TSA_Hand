@@ -5,6 +5,7 @@
 #include "tim.h"
 #include "adc.h"
 #include "usart.h"
+#include "sensor_feedback.h"
 
 /* 系统常量定义 */
 #define Motor_Num 4             // 系统管理的电机总数 (食指、中指、无名指、小指)
@@ -68,6 +69,25 @@ extern PID_Increment_Struct PID_Angle[Motor_Num];      // 出轴角度环 PID
 extern PID_Increment_Struct PID_Position[Motor_Num];   // 关节位置环 PID
 extern uint16_t ADC_HallValue[Hall_Num];              // 关节传感器滤波后的 ADC 值
 extern float TargetPosition[Hall_Num];               // 关节目标位置 (调试用)
+
+// 统一保持原motor1/2/3编号，力缓存顺序为中指、无名指、小指。
+extern const uint8_t tactile_motor_indices[SENSOR_FORCE_COUNT];
+typedef SensorFeedbackSnapshot_t MotorTelemetrySnapshot_t;
+
+// Motor_GetTactileChannel：查询电机对应的触觉缓存下标
+// 参数：motor_index - 电机编号
+// 返回值：0～2或未绑定时的-1
+int8_t Motor_GetTactileChannel(uint8_t motor_index);
+
+// Motor_ConvertJointAngleTenths：用原标定端点换算关节角度
+// 参数：motor_index - 关节编号；adc_value - ADC均值；tenths - 输出地址
+// 返回值：true表示合法，false表示标定或参数无效
+bool Motor_ConvertJointAngleTenths(uint8_t motor_index, uint16_t adc_value, uint16_t *tenths);
+
+// Motor_GetTelemetrySnapshot：复制采集缓存，不等待新数据
+// 参数：snapshot - 输出地址
+// 返回值：无
+void Motor_GetTelemetrySnapshot(MotorTelemetrySnapshot_t *snapshot);
 
 /* 核心 API 函数原型 */
 

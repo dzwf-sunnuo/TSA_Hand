@@ -51,6 +51,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/admittance.c
     Core/Src/Tactile_Sensor.c
     Core/Src/angle_codec.c
+    Core/Src/sensor_feedback.c
+    Core/Src/can_telemetry.c
 )
 
 # Add include paths
