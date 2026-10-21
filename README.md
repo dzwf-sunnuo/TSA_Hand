@@ -252,3 +252,8 @@ python tools/多速度减速比数据采集.py COM8 230400 --limits 20,40,60,80,
 首次联调前请完整阅读 [导纳控制上位机指令说明](docs/Admittance_Control_Protocol.md)，并确保机构留有足够的安全行程。
 
 CAN角度/力上报及Reg[18..20]配置见[CAN反馈协议](docs/CAN_Telemetry_Protocol.md)。一号板本次改动仅完成源码实现与静态核对，未编译、未运行测试、未烧录；二号板此前的编译结果不代表本次一号板已编译通过。
+
+
+## CCMRAM数据分配
+
+两板的CPU反馈缓存、采集/CAN状态、控制静态状态，以及空闲/软件定时器任务静态栈与控制块已迁入CCMRAM。ADC原始DMA缓冲、包含UART DMA接收区的modbus结构体和动态堆保留在普通SRAM。具体对象、初始化路径及验证边界见[CCMRAM数据分配说明](docs/CCMRAM_Layout.md)。本次仅做源码及静态检查，未编译或运行测试。

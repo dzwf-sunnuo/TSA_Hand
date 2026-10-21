@@ -29,7 +29,7 @@ __CCM_RAM_DATA static uint8_t mode7_force_locked[TACTILE_FINGER_COUNT] = {0};
 const uint16_t tactile_enable_masks[TACTILE_FINGER_COUNT] = {0x0003U, 0x0008U};
 static const char *const tactile_sensor_names[TACTILE_FINGER_COUNT] = {"Thumb", "Index"};
 // 模式6/7分别记录第一关节是否已经到达分配边界，避免提前让第二关节退让。
-static uint8_t thumb_secondary_ready[2] = {0U, 0U};
+__CCM_RAM_DATA static uint8_t thumb_secondary_ready[2] = {0U, 0U};
 
 /* 堵转保护 */
 #define STALL_TIMEOUT_SECONDS 5.0f   // 堵转判定时间 (秒)
@@ -69,7 +69,7 @@ PID_Increment_Struct PID_Speed[Motor_Num] __CCM_RAM_DATA = {0};    // 速度环 
 PID_Increment_Struct PID_Position[Motor_Num] __CCM_RAM_DATA = {0}; // 关节位置环 PID 状态
 PID_Increment_Struct PID_Angle[Motor_Num] __CCM_RAM_DATA = {0};    // 出轴角度环 PID 状态
 
-uint16_t ADC_HallValue[Hall_Num] = {0}; // 经过滤波后的 ADC 原始值
+__CCM_RAM_DATA uint16_t ADC_HallValue[Hall_Num] = {0}; // CPU使用的滤波结果，非DMA目标，放入CCMRAM
 
 /**
  * @brief 计算常数预推导，老电机要全部*20
@@ -272,7 +272,7 @@ static void Motor_PrepareAdmittanceTargets(uint8_t mode, uint8_t io_flag,
     const float minimum = joint_mode ? THUMB_MIN_JOINT_ANGLE : 0.0f;
     const uint8_t phase_index = joint_mode ? 1U : 0U;
     uint8_t *locked = joint_mode ? mode7_force_locked : mode6_force_locked;
-    static uint16_t previous_thumb_base[2][2] = {{0U, 0U}, {0U, 0U}};
+    __CCM_RAM_DATA static uint16_t previous_thumb_base[2][2] = {{0U, 0U}, {0U, 0U}};
     // 改写任一拇指基准后重新确认到位，不能沿用上一组目标的第二关节放行状态。
     if (previous_thumb_base[phase_index][0] != Reg[0] ||
         previous_thumb_base[phase_index][1] != Reg[1]) {
@@ -418,7 +418,7 @@ void Motor_Control_Loop(void)
         }
 
         // 模式6与7的退让单位不同，切换模式时清理共享积分与先后阶段，不继承另一模式的数值。
-        static uint8_t previous_mode = 0U;
+        __CCM_RAM_DATA static uint8_t previous_mode = 0U;
         if (mode != previous_mode) {
             for (uint8_t channel = 0U; channel < TACTILE_FINGER_COUNT; channel++) {
                 Admittance_Reset(&adm_ctrl[channel]);
@@ -432,8 +432,8 @@ void Motor_Control_Loop(void)
             admittance_targets, admittance_ready);
 
         /* 堵转保护状态 (跨调用保持) */
-        static uint16_t stall_timer[Motor_Num] = {0};
-        static float    stall_target[Motor_Num] = {0};
+        __CCM_RAM_DATA static uint16_t stall_timer[Motor_Num] = {0}; // CPU控制状态，非DMA缓冲
+        __CCM_RAM_DATA static float stall_target[Motor_Num] = {0};
 
         for (int i = 0; i < Motor_Num; i++) {
             /* 2.1 状态采集 (已优化：单词读取 delta 确保速度/位置同步) */

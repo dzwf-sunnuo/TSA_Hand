@@ -9,8 +9,9 @@
 #define TACTILE_DATA_WAIT_US 30U
 #define MAX_SENSORS 2U // 一号板只有拇指和食指两个物理传感器
 
-static Tactile_Sensor_t *s_sensors[MAX_SENSORS];
-static uint8_t s_sensor_count;
+// 注册表仅保存CPU使用的传感器指针，迁入CCMRAM；不在这里分配任何DMA收发缓冲。
+__CCM_RAM_DATA static Tactile_Sensor_t *s_sensors[MAX_SENSORS];
+__CCM_RAM_DATA static uint8_t s_sensor_count;
 
 // Tactile_DelayUs：按真实微秒等待，不清零共享自由运行计数器
 // 参数：us - 等待微秒数，0表示立即返回

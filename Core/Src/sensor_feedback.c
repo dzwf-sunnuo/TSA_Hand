@@ -18,15 +18,16 @@ extern uint16_t ADC_NativeValue[60]; // 普通SRAM，DMA可以访问
 extern uint16_t ADC_Snapshot[60];    // 保留原始调试快照，只有冻结后才写入
 extern osSemaphoreId_t Sem_ADC_Done;
 
-static SensorFeedbackSnapshot_t s_snapshot;
-static Tactile_Sensor_t s_sensors[SENSOR_FORCE_COUNT];
-static uint32_t s_retry_tick[SENSOR_FORCE_COUNT];
-static uint8_t s_retry_pending[SENSOR_FORCE_COUNT];
-static volatile uint32_t s_adc_batch;
-static volatile uint32_t s_adc_completed_batch;
-static volatile uint32_t s_adc_complete_tick;
-static volatile uint8_t s_adc_active;
-static volatile uint8_t s_adc_success;
+// 成品缓存、传感器句柄及批次状态仅由CPU/中断访问，放入CCMRAM；DMA原始缓冲仍在普通SRAM。
+__CCM_RAM_DATA static SensorFeedbackSnapshot_t s_snapshot;
+__CCM_RAM_DATA static Tactile_Sensor_t s_sensors[SENSOR_FORCE_COUNT];
+__CCM_RAM_DATA static uint32_t s_retry_tick[SENSOR_FORCE_COUNT];
+__CCM_RAM_DATA static uint8_t s_retry_pending[SENSOR_FORCE_COUNT];
+__CCM_RAM_DATA static volatile uint32_t s_adc_batch;
+__CCM_RAM_DATA static volatile uint32_t s_adc_completed_batch;
+__CCM_RAM_DATA static volatile uint32_t s_adc_complete_tick;
+__CCM_RAM_DATA static volatile uint8_t s_adc_active;
+__CCM_RAM_DATA static volatile uint8_t s_adc_success;
 
 // SensorFeedback_IsFresh：判断有效样本是否仍在允许年龄范围内
 // 参数：valid - 有效状态；update_ms - 成功时间；now_ms - 当前时间
