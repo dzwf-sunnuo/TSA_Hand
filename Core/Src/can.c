@@ -60,9 +60,6 @@ void MX_CAN1_Init(void)
 
 }
 /* CAN2 init function */
-// MX_CAN2_Init：配置1Mbit/s的从板反馈总线，并启用总线关闭自动恢复
-// 参数：无
-// 返回值：无
 void MX_CAN2_Init(void)
 {
 
@@ -80,7 +77,7 @@ void MX_CAN2_Init(void)
   hcan2.Init.TimeSeg1 = CAN_BS1_10TQ;
   hcan2.Init.TimeSeg2 = CAN_BS2_3TQ;
   hcan2.Init.TimeTriggeredMode = DISABLE;
-  hcan2.Init.AutoBusOff = ENABLE;
+  hcan2.Init.AutoBusOff = DISABLE;
   hcan2.Init.AutoWakeUp = DISABLE;
   hcan2.Init.AutoRetransmission = DISABLE;
   hcan2.Init.ReceiveFifoLocked = DISABLE;
@@ -160,7 +157,7 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
     GPIO_InitStruct.Alternate = GPIO_AF9_CAN2;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    // CAN2只启用反馈使用的FIFO0中断，优先级允许调用RTOS队列接口。
+    // 从板反馈通过FIFO0进入RTOS队列，恢复工程重新生成时缺失的接收中断。
     HAL_NVIC_SetPriority(CAN2_RX0_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(CAN2_RX0_IRQn);
 
@@ -170,7 +167,7 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
   }
 }
 
-// HAL_CAN_MspDeInit：关闭目标CAN引脚与中断，正确维护共享CAN1时钟
+// HAL_CAN_MspDeInit：关闭目标CAN的引脚、中断并维护共享时钟计数
 // 参数：canHandle - 待释放的CAN实例
 // 返回值：无
 void HAL_CAN_MspDeInit(CAN_HandleTypeDef* canHandle)

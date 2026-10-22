@@ -60,6 +60,8 @@ extern CAN_HandleTypeDef hcan2;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim7;
+extern DMA_HandleTypeDef hdma_uart4_rx;
+extern DMA_HandleTypeDef hdma_uart4_tx;
 extern DMA_HandleTypeDef hdma_usart1_rx;
 extern DMA_HandleTypeDef hdma_usart1_tx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
@@ -192,6 +194,20 @@ void DMA1_Stream1_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles DMA1 stream2 global interrupt.
+  */
+void DMA1_Stream2_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Stream2_IRQn 0 */
+
+  /* USER CODE END DMA1_Stream2_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_uart4_rx);
+  /* USER CODE BEGIN DMA1_Stream2_IRQn 1 */
+
+  /* USER CODE END DMA1_Stream2_IRQn 1 */
+}
+
+/**
   * @brief This function handles DMA1 stream3 global interrupt.
   */
 void DMA1_Stream3_IRQHandler(void)
@@ -203,6 +219,20 @@ void DMA1_Stream3_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream3_IRQn 1 */
 
   /* USER CODE END DMA1_Stream3_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA1 stream4 global interrupt.
+  */
+void DMA1_Stream4_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Stream4_IRQn 0 */
+
+  /* USER CODE END DMA1_Stream4_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_uart4_tx);
+  /* USER CODE BEGIN DMA1_Stream4_IRQn 1 */
+
+  /* USER CODE END DMA1_Stream4_IRQn 1 */
 }
 
 /**
@@ -429,20 +459,20 @@ void USART6_IRQHandler(void)
   /* USER CODE END USART6_IRQn 1 */
 }
 
-// CAN2_RX0_IRQHandler：转交从板反馈FIFO0中断给HAL统一处理
+// CAN2_RX0_IRQHandler：将两块从板反馈的FIFO0中断交给HAL解析和回调
 // 参数：无
 // 返回值：无
 void CAN2_RX0_IRQHandler(void)
 {
-    HAL_CAN_IRQHandler(&hcan2);
+  HAL_CAN_IRQHandler(&hcan2);
 }
 
-// UART4_IRQHandler：推进反馈帧的逐字节发送和整帧完成回调
+// UART4_IRQHandler：在DMA搬运完成后处理UART线路发送完成和错误事件
 // 参数：无
 // 返回值：无
 void UART4_IRQHandler(void)
 {
-    HAL_UART_IRQHandler(&huart4);
+  HAL_UART_IRQHandler(&huart4);
 }
 
 /* USER CODE BEGIN 1 */

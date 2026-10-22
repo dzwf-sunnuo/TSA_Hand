@@ -23,6 +23,8 @@ typedef struct {
 
 volatile Uart4TelemetryStats_t uart4TelemetryStats;
 static osThreadId_t s_task;
+static osMutexId_t s_config_mutex;
+// 发送缓冲放在DMA可访问的普通SRAM，不能移入CCMRAM；保持到UART最后一个停止位发送完成。
 static uint8_t s_tx_buffer[UART4_TELEMETRY_FRAME_SIZE];
 static volatile uint8_t s_tx_busy;
 static volatile uint8_t s_tx_error;
@@ -86,7 +88,7 @@ static void Uart4Telemetry_Encode(uint8_t frame[UART4_TELEMETRY_FRAME_SIZE],
     frame[24] = 0xAAU;
 }
 
-// Uart4Telemetry_Send：只在配置仍匹配且发送空闲时提交完整帧
+// Uart4Telemetry_Send：用任务互斥锁校验配置并提交整帧DMA发送，不屏蔽全局中断
 // 参数：config - 编码依据的配置快照
 // 返回值：无；配置已变化时丢弃本次编码，等待任务处理通知
 static void Uart4Telemetry_Send(const TelemetryConfig_t *config)
@@ -95,8 +97,8 @@ static void Uart4Telemetry_Send(const TelemetryConfig_t *config)
     uint8_t frame[UART4_TELEMETRY_FRAME_SIZE];
     SlaveFeedback_GetSnapshot(&snapshot);
     Uart4Telemetry_Encode(frame, &snapshot, config);
-    taskENTER_CRITICAL();
-    // 与MODBUS配置提交互斥，确保关闭应答之后不会再启动旧配置帧。
+    if (!Uart4Telemetry_LockConfig()) return;
+    // 与MODBUS配置提交串行化，锁只持有到DMA启动，不等待约1.085ms的线路发送。
     if (Reg[UART4_REPORT_REG_ENABLE] == 1U &&
         Reg[UART4_REPORT_REG_FREQUENCY] == config->frequency &&
         Reg[UART4_REPORT_REG_RATIO] == config->ratio_tenths &&
@@ -104,16 +106,24 @@ static void Uart4Telemetry_Send(const TelemetryConfig_t *config)
         if (s_tx_busy != 0U || huart4.gState != HAL_UART_STATE_READY) {
             uart4TelemetryStats.busy_skips++;
         } else {
+            // 上报任务是唯一发送者；确认空闲后才覆盖缓冲，复制过程允许其他中断运行。
             memcpy(s_tx_buffer, frame, sizeof(s_tx_buffer));
             s_tx_start_ms = HAL_GetTick();
             s_tx_busy = 1U;
-            if (HAL_UART_Transmit_IT(&huart4, s_tx_buffer, sizeof(s_tx_buffer)) != HAL_OK) {
+            // 只暂缓本路DMA中断，避免HAL默认开启的半传输中断抢先进入；其他中断不受影响。
+            HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);
+            HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&huart4, s_tx_buffer, sizeof(s_tx_buffer));
+            if (status == HAL_OK) {
+                // 一帧只需要DMA传输完成和UART线路发送完成，不需要半帧通知。
+                __HAL_DMA_DISABLE_IT(huart4.hdmatx, DMA_IT_HT);
+            } else {
                 s_tx_busy = 0U;
                 uart4TelemetryStats.tx_errors++;
             }
+            HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
         }
     }
-    taskEXIT_CRITICAL();
+    Uart4Telemetry_UnlockConfig();
 }
 
 // Uart4Telemetry_NextInterval：通过余数累计保持整数Hz的长期平均周期
@@ -147,10 +157,17 @@ static void Uart4Telemetry_Task(void *argument)
         uint32_t now = osKernelGetTickCount();
         if (s_tx_error != 0U || (s_tx_busy != 0U &&
             (uint32_t)(HAL_GetTick() - s_tx_start_ms) >= TELEMETRY_TX_TIMEOUT_MS)) {
-            // 在任务内终止失常发送，HAL会关闭发送中断并恢复空闲状态。
-            (void)HAL_UART_AbortTransmit(&huart4);
-            s_tx_error = 0U;
-            s_tx_busy = 0U;
+            // 在任务内同步终止失常DMA和UART发送，硬件停止读取缓冲后才允许下一帧覆盖。
+            HAL_StatusTypeDef abort_status = HAL_UART_AbortTransmit(&huart4);
+            if ((huart4.hdmatx->Instance->CR & DMA_SxCR_EN) != 0U) {
+                // HAL可能因DMA停止超时提前返回；下次维护周期继续尝试停止该通道。
+                (void)HAL_DMA_Abort(huart4.hdmatx);
+            }
+            bool stopped = abort_status == HAL_OK &&
+                (huart4.hdmatx->Instance->CR & DMA_SxCR_EN) == 0U;
+            // 未确认DMA停下时继续占用缓冲，防止覆盖硬件仍可能读取的数据。
+            s_tx_error = stopped ? 0U : 1U;
+            s_tx_busy = stopped ? 0U : 1U;
             uart4TelemetryStats.tx_errors++;
         }
         if (config.enabled != applied.enabled || config.frequency != applied.frequency) {
@@ -177,17 +194,38 @@ static void Uart4Telemetry_Task(void *argument)
     }
 }
 
-// Uart4Telemetry_Init：创建低于推杆控制优先级的上报任务
+// Uart4Telemetry_Init：创建配置互斥锁和低于推杆控制优先级的上报任务
 // 参数：无
 // 返回值：true表示创建成功
 bool Uart4Telemetry_Init(void)
 {
+    const osMutexAttr_t mutex_attr = {
+        .name = "Uart4Config", .attr_bits = osMutexPrioInherit
+    };
+    s_config_mutex = osMutexNew(&mutex_attr);
+    if (s_config_mutex == NULL) return false;
     const osThreadAttr_t attr = {
         .name = "Uart4Telemetry", .stack_size = 1536U,
         .priority = osPriorityBelowNormal
     };
     s_task = osThreadNew(Uart4Telemetry_Task, NULL, &attr);
     return s_task != NULL;
+}
+
+// Uart4Telemetry_LockConfig：串行化上报配置提交与DMA启动，等待期间允许中断和其他任务运行
+// 参数：无；只能由任务调用，且不能在临界区内调用
+// 返回值：true表示取得互斥锁，false表示未初始化或锁获取失败
+bool Uart4Telemetry_LockConfig(void)
+{
+    return s_config_mutex != NULL && osMutexAcquire(s_config_mutex, osWaitForever) == osOK;
+}
+
+// Uart4Telemetry_UnlockConfig：释放配置与DMA启动共用的任务互斥锁
+// 参数：无；仅由已成功取得互斥锁的任务调用
+// 返回值：无
+void Uart4Telemetry_UnlockConfig(void)
+{
+    (void)osMutexRelease(s_config_mutex);
 }
 
 // Uart4Telemetry_NotifyConfigChanged：在寄存器提交后发送任务标志

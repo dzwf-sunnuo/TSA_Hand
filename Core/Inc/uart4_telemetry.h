@@ -28,6 +28,16 @@ bool Uart4Telemetry_Init(void);
 // 返回值：无
 void Uart4Telemetry_NotifyConfigChanged(void);
 
+// Uart4Telemetry_LockConfig：取得上报配置与DMA启动共用的互斥锁
+// 参数：无；只能在任务上下文、临界区外调用
+// 返回值：true表示已取得，false表示初始化或获取失败
+bool Uart4Telemetry_LockConfig(void);
+
+// Uart4Telemetry_UnlockConfig：释放上报配置与DMA启动共用的互斥锁
+// 参数：无；必须由取得互斥锁的同一任务调用
+// 返回值：无
+void Uart4Telemetry_UnlockConfig(void);
+
 // Uart4Telemetry_OnTxComplete：释放已完整发送的UART4缓冲区
 // 参数：无，仅由UART4发送完成回调调用
 // 返回值：无

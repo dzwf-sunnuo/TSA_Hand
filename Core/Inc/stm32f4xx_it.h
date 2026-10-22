@@ -53,7 +53,9 @@ void BusFault_Handler(void);
 void UsageFault_Handler(void);
 void DebugMon_Handler(void);
 void DMA1_Stream1_IRQHandler(void);
+void DMA1_Stream2_IRQHandler(void);
 void DMA1_Stream3_IRQHandler(void);
+void DMA1_Stream4_IRQHandler(void);
 void DMA1_Stream5_IRQHandler(void);
 void DMA1_Stream6_IRQHandler(void);
 void CAN1_RX0_IRQHandler(void);
@@ -70,12 +72,12 @@ void DMA2_Stream2_IRQHandler(void);
 void DMA2_Stream6_IRQHandler(void);
 void DMA2_Stream7_IRQHandler(void);
 void USART6_IRQHandler(void);
-// CAN2_RX0_IRQHandler：响应CAN2从板反馈接收中断
+// CAN2_RX0_IRQHandler：处理从板CAN反馈接收
 // 参数：无
 // 返回值：无
 void CAN2_RX0_IRQHandler(void);
 
-// UART4_IRQHandler：响应UART4反馈发送中断
+// UART4_IRQHandler：处理DMA发送后的UART线路完成及错误事件
 // 参数：无
 // 返回值：无
 void UART4_IRQHandler(void);

@@ -199,9 +199,16 @@ void modbus2_Func6(void)
     uint16_t value = Modbus_ReadU16(&modbus2.rcbuf[4]);
     if (start >= MODBUS_REG_COUNT) { Modbus_SendException(0x02U); return; }
     if (!Modbus_ValidateValue(start, value)) { Modbus_SendException(0x03U); return; }
+    bool telemetry_config = Modbus_RangeOverlaps(start, 1U,
+        UART4_REPORT_REG_ENABLE, UART4_REPORT_REG_FORCE_MIN);
+    // 配置写入与DMA启动共用互斥锁，禁止在全局临界区内等待任务锁。
+    if (telemetry_config && !Uart4Telemetry_LockConfig()) {
+        Modbus_SendException(0x04U); return;
+    }
     taskENTER_CRITICAL();
     Reg[start] = value;
     taskEXIT_CRITICAL();
+    if (telemetry_config) Uart4Telemetry_UnlockConfig();
     memcpy(modbus2.sendbuf, modbus2.rcbuf, 6U);
     Modbus_SendResponse(6U);
     Modbus_ApplyWrite(start, 1U);
@@ -226,11 +233,18 @@ void modbus2_Func16(void)
             Modbus_SendException(0x03U); return;
         }
     }
+    bool telemetry_config = Modbus_RangeOverlaps(start, count,
+        UART4_REPORT_REG_ENABLE, UART4_REPORT_REG_FORCE_MIN);
+    // 整帧验证通过后才取得配置锁，跨控制区和上报区的写入仍然一次性提交。
+    if (telemetry_config && !Uart4Telemetry_LockConfig()) {
+        Modbus_SendException(0x04U); return;
+    }
     taskENTER_CRITICAL();
     for (uint16_t i = 0U; i < count; ++i) {
         Reg[start + i] = Modbus_ReadU16(&modbus2.rcbuf[7U + 2U * i]);
     }
     taskEXIT_CRITICAL();
+    if (telemetry_config) Uart4Telemetry_UnlockConfig();
     memcpy(modbus2.sendbuf, modbus2.rcbuf, 6U);
     Modbus_SendResponse(6U);
     Modbus_ApplyWrite(start, count);
