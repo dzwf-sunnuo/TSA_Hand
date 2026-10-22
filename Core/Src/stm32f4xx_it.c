@@ -56,6 +56,7 @@
 
 /* External variables --------------------------------------------------------*/
 extern CAN_HandleTypeDef hcan1;
+extern CAN_HandleTypeDef hcan2;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim7;
@@ -70,6 +71,7 @@ extern DMA_HandleTypeDef hdma_usart6_tx;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
+extern UART_HandleTypeDef huart4;
 extern UART_HandleTypeDef huart6;
 extern TIM_HandleTypeDef htim14;
 
@@ -425,6 +427,22 @@ void USART6_IRQHandler(void)
   /* USER CODE BEGIN USART6_IRQn 1 */
 
   /* USER CODE END USART6_IRQn 1 */
+}
+
+// CAN2_RX0_IRQHandler：转交从板反馈FIFO0中断给HAL统一处理
+// 参数：无
+// 返回值：无
+void CAN2_RX0_IRQHandler(void)
+{
+    HAL_CAN_IRQHandler(&hcan2);
+}
+
+// UART4_IRQHandler：推进反馈帧的逐字节发送和整帧完成回调
+// 参数：无
+// 返回值：无
+void UART4_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart4);
 }
 
 /* USER CODE BEGIN 1 */

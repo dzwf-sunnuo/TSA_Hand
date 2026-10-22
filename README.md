@@ -10,12 +10,15 @@ FreeRTOS 实时操作系统驱动的灵巧手主板固件。运行于 STM32F407V
 | Flash | 512 KB |
 | RAM | 128 KB + 64 KB CCMRAM |
 | RTOS | FreeRTOS V10.3.1 (CMSIS-OS V2 API, heap_4) |
-| CAN | CAN1 (PA11/PA12), 1 Mbps, ID=0x020(右手) 或 0x021(左手) |
-| 上位机通信 | RS485 (USART2, 115200) — Modbus RTU 从机, 地址 0x10 |
-| 手指板通信 | RS485 (USART1, 115200) — Modbus RTU 主机 (slave 0x01/0x02) |
+| CAN | CAN1 (PA11/PA12)保留动作控制；CAN2 (PB12/PB13)接收从板反馈；均为1 Mbps |
+| 上位机通信 | RS485 (USART1, 230400) — Modbus RTU 从机, 地址 0x10 |
+| 手指板通信 | RS485 (USART2, 230400) — Modbus RTU 主机 (slave 0x01/0x02) |
 | 手腕电机 | USART3 + USART6 (921600) — 推杆电机直驱 |
 | 红外遥控 | TIM3 CH3 (PC8) — NEC 协议 |
-| 调试输出 | UART4 (115200) — printf |
+| 汇总反馈 | UART4 (230400) — 默认10 Hz、25字节二进制帧，帧头FF、帧尾AA |
+| 语音接口预留 | UART5 — 当前不开发业务 |
+
+角度、五指合力、状态位及上报配置详见[主板控制与反馈通信协议](docs/Master_Feedback_Protocol.md)。新增`Reg[30..33]`依次为上报使能、频率、法向/切向阈值×10、合力门槛×10，默认值依次为1、10、10、30。
 
 ## 目录结构
 
@@ -76,10 +79,12 @@ cmake --build build/Debug
 | 任务 | 优先级 | 周期 | 触发方式 | 职责 |
 |---|---|---|---|---|
 | `Task_WristMotion` | AboveNormal | 40ms (队列超时) | `Queue_WristCmd` | 手腕摆动/旋转 S 曲线运动 |
-| `Task_ModbusPC` | Normal | 事件驱动 | `Sem_Uart2_RxIdle` | 解析 PC Modbus 指令, 更新 `Reg[]` |
+| `Task_ModbusPC` | Normal | 接收事件及错误恢复 | `Sem_Uart1_RxIdle` | 解析USART1 PC Modbus指令，按写入范围更新配置或触发控制 |
 | `Task_CAN_Process` | Normal | 事件驱动 | `Queue_CAN_Rx` | CAN 协议解析, 心跳, 直接硬件指令 |
 | `Task_IR_Process` | Normal | 事件驱动 | `Sem_IR_Ready` | 红外遥控按键解析 |
 | `Task_SlaveDispatch` | BelowNormal | 事件驱动 | `Sem_NewSlaveCmd` | 向手指从板分发 485 指令 |
+| `SlaveFeedback` | Normal | CAN2接收队列 | 独立反馈队列 | 解码两板角度和力，分别维护有效性与时间戳 |
+| `Uart4Telemetry` | BelowNormal | 默认100 ms | 周期及配置通知 | 从缓存组装25字节反馈，以UART4中断发送 |
 
 ### 消息流
 
@@ -128,13 +133,15 @@ Modbus → Task_ModbusPC ──────────────────�
 ## 与其他项目的关系
 
 ```
-FR_Hand_m (本机)  ──RS485──→  FR_Hand_s × 2 (手指从机)
-     │                              ├── slave 0x01 = 拇指板 (3 电机)
-     │                              └── slave 0x02 = 四指板 (4 电机)
+FR_Hand_m (本机) ──USART2 / MODBUS──→ 两块触觉手指从板
+     │                              ├── slave 0x01 = 拇指motor0/1/2、食指motor3
+     │                              └── slave 0x02 = 中指motor1、无名指motor2、小指motor3
+     ├── CAN2 ←── 两块从板反馈 (1 Mbit/s)
+     ├── UART4 ──→ 六角度、五合力、状态 (默认10 Hz)
      │
-     ├── CAN  ──→  上位机 / 手柄
+     ├── CAN1 ←─→  上位机 / 手柄
      ├── IR   ←──  遥控器 (NEC)
-     └── Modbus ←─ PC 调试工具
+     └── USART1 / Modbus ←─ PC 调试工具
 ```
 
 | 目录 | 角色 | 状态 |
@@ -150,4 +157,4 @@ FR_Hand_m (本机)  ──RS485──→  FR_Hand_s × 2 (手指从机)
 - **手腕运动采用消息队列驱动** (`Queue_WristCmd`)：`osMessageQueueGet(40ms 超时)` 同时充当命令通道和 40ms 心跳定时，消除了 `wrist_enabled` 全局变量
 - **`finger_motion` 打断用信号量** (`Sem_NewMotionCmd`)：替代了原来只响应红外遥控的 `rcvFlag` 全局变量，IR/CAN/Modbus 任意新指令都能打断正在播放的手指动画
 - **CAN 消息分层**：非动作消息（心跳、直接硬件指令）在 `Task_CAN_Process_Entry` 中直接处理；动作消息经 `CAN_Msg_MapToAction()`(纯映射) → `Action_Dispatch()`(纯分发)
-- **`pending_slave_dispatch` 已消除**：用 `Sem_NewSlaveCmd` 本身充当分发信号，不再需要额外的全局标志位
+- **按写入范围分发**：`Sem_NewSlaveCmd`配合两板更新掩码，仅发送被控制区写入命中的从板；配置写入与只读请求不重复发送电机指令。

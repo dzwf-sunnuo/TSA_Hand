@@ -7,6 +7,11 @@
 #include "wrist.h"
 #include "motion.h"
 #include "MyCan.h"
+#include "slave_feedback.h"
+#include "uart4_telemetry.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include <string.h>
 
 /* CAN 通信常量 */
 #define CAN_HAND_ID             0x020   // 手部控制 CAN ID: 0x020=右手, 0x021=左手 (二选一)
@@ -24,12 +29,14 @@ osThreadId_t TaskSlaveDispatchHandle;
 osThreadId_t TaskCANHandle;
 osThreadId_t TaskIRHandle;
 
-osSemaphoreId_t Sem_Uart2_RxIdle;
+osSemaphoreId_t Sem_Uart1_RxIdle;
 osSemaphoreId_t Sem_NewSlaveCmd;
 osSemaphoreId_t Sem_IR_Ready;
 osSemaphoreId_t Sem_NewMotionCmd;      // finger_motion 打断信号
 osMessageQueueId_t Queue_CAN_Rx;
 osMessageQueueId_t Queue_WristCmd;   // 手腕命令
+static uint8_t s_slave_dispatch_mask;
+static volatile uint8_t s_pc_rx_error;
 
 /* ================== 系统全局状态 ================== */
 volatile uint8_t  sys_infrared_enable = 1;       // 红外遥控使能
@@ -453,15 +460,6 @@ void Task_WristMotion_Entry(void *argument)
         }
     }
 }
-//创建一个低优先级的任务用于打印调试信息
-void Task_DebugPrint_Entry(void *argument)
-{
-    for (;;)
-    {
-        // 在这里添加调试信息打印逻辑
-    }
-}
-
 void Task_Demo_Entry(void *argument){
     osDelay(1000); // 等待系统稳定
     vTaskDelete(NULL); 
@@ -478,10 +476,41 @@ void Task_Demo_Entry(void *argument){
  *  初始化
  * ================================================================ */
 
+// App_ModbusPC_StartReceive：启动USART1的DMA空闲帧接收并关闭半传输通知
+// 参数：无
+// 返回值：无，启动失败时由上位机任务周期重试
+static void App_ModbusPC_StartReceive(void)
+{
+    taskENTER_CRITICAL();
+    // 接收空闲与缓冲区可复用必须同时成立，防止超时唤醒恰逢IDLE交帧。
+    if (modbus2.reflag == 0U && s_pc_rx_error == 0U &&
+        huart1.RxState == HAL_UART_STATE_READY &&
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart1, modbus2.rcbuf,
+                                    sizeof(modbus2.rcbuf)) == HAL_OK) {
+        // 半缓冲到达不表示完整MODBUS帧，避免较长写入被提前解析。
+        __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+    }
+    taskEXIT_CRITICAL();
+}
+
+// App_RequestSlaveDispatch：合并从板更新位并唤醒分发任务
+// 参数：board_mask - bit0为一号板，bit1为二号板
+// 返回值：无
+void App_RequestSlaveDispatch(uint8_t board_mask)
+{
+    taskENTER_CRITICAL();
+    s_slave_dispatch_mask |= board_mask & 0x03U;
+    taskEXIT_CRITICAL();
+    if (Sem_NewSlaveCmd != NULL) (void)osSemaphoreRelease(Sem_NewSlaveCmd);
+}
+
+// App_Comm_Init：建立控制、反馈和上报任务，分别启动USART1及两路CAN
+// 参数：无，调度器启动前调用
+// 返回值：无，软件资源建立失败时进入项目统一错误处理
 void App_Comm_Init(void)
 {
     /* 1. 创建信号量 */
-    Sem_Uart2_RxIdle = osSemaphoreNew(1, 0, NULL);
+    Sem_Uart1_RxIdle = osSemaphoreNew(1, 0, NULL);
     Sem_NewSlaveCmd  = osSemaphoreNew(1, 0, NULL);
     Sem_IR_Ready     = osSemaphoreNew(1, 0, NULL);
     Sem_NewMotionCmd = osSemaphoreNew(5, 0, NULL);  // 最多缓存 5 次打断信号
@@ -489,6 +518,7 @@ void App_Comm_Init(void)
     /* 2. 创建消息队列 */
     Queue_CAN_Rx   = osMessageQueueNew(10, sizeof(App_CAN_Msg_t), NULL);
     Queue_WristCmd = osMessageQueueNew(4,  sizeof(WristCmd_t),  NULL); // 手腕命令
+    if (!ModbusMaster_Init()) Error_Handler();
 
     /* 3. 创建任务 */
     const osThreadAttr_t modbus_attr = { .name = "ModbusPC", .stack_size = 512 * 4, .priority = osPriorityNormal };
@@ -506,15 +536,12 @@ void App_Comm_Init(void)
     const osThreadAttr_t wrist_attr = { .name = "WristMotion", .stack_size = 512 * 4, .priority = osPriorityAboveNormal };
     osThreadNew(Task_WristMotion_Entry, NULL, &wrist_attr);
 
-    const osThreadAttr_t debug_attr = { .name = "DebugPrint", .stack_size = 512 * 4, .priority = osPriorityBelowNormal };
-    osThreadNew(Task_DebugPrint_Entry, NULL, &debug_attr);
-
     //针对展示的灵巧手创建一个从上电就自动开始的任务，用于展示
     const osThreadAttr_t demo_attr = { .name = "DemoTask", .stack_size = 512 * 4, .priority = osPriorityAboveNormal };
     osThreadNew(Task_Demo_Entry, NULL, &demo_attr);
 
     /* 4. 启动硬件 */
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, modbus2.rcbuf, sizeof(modbus2.rcbuf));
+    // USART1接收由其任务首次运行时启动，避免调度前进入RTOS临界区。
 
     // CAN 硬件过滤器: 仅接收 CAN_HAND_ID (右手 0x020 或左手 0x021，二选一)
     MyCan_Init();
@@ -522,6 +549,7 @@ void App_Comm_Init(void)
                                     CAN_HAND_ID, CAN_HAND_ID, CAN_RX_FIFO0);
     MyCan_Start();
     MyCan_SendStdData(CAN_HAND_ID, (uint8_t[]){CAN_HEARTBEAT_RESPONSE}, 1); // 上电即发心跳
+    if (!SlaveFeedback_Init() || !Uart4Telemetry_Init()) Error_Handler();
     // 红外遥控初始化 (TIM3 输入捕获)
     InfraredRemote_Init();
 }
@@ -530,38 +558,51 @@ void App_Comm_Init(void)
 /*                   RTOS 任务实现                             */
 /* ========================================================== */
 
-/**
- * @brief 任务：处理上位机 Modbus2 指令
- */
+// Task_ModbusPC_Entry：解析USART1完整请求，处理接收错误并恢复DMA接收
+// 参数：argument - 未使用
+// 返回值：无，任务持续运行
 void Task_ModbusPC_Entry(void *argument)
 {
+    (void)argument;
+    App_ModbusPC_StartReceive();
     for(;;)
     {
-        if (osSemaphoreAcquire(Sem_Uart2_RxIdle, osWaitForever) == osOK)
-        {
-            modbus2.reflag = 1;
-            modbus2_Event();
-
-            // 每次收到有效 Modbus 帧都通知分发任务 (信号量替代了原来的 pending_slave_dispatch 全局变量)
-            osSemaphoreRelease(Sem_NewSlaveCmd);
-
-            HAL_UARTEx_ReceiveToIdle_DMA(&huart2, modbus2.rcbuf, sizeof(modbus2.rcbuf));
+        if (osSemaphoreAcquire(Sem_Uart1_RxIdle, 20U) == osOK) {
+            if (s_pc_rx_error != 0U) {
+                (void)HAL_UART_AbortReceive(&huart1);
+                modbus2.reflag = 0U;
+                modbus2.recount = 0U;
+                s_pc_rx_error = 0U;
+            } else {
+                modbus2_Event();
+            }
         }
+        App_ModbusPC_StartReceive();
     }
 }
 
-/**
- * @brief 任务：向手指驱动板下发指令
- */
+// Task_SlaveDispatch_Entry：按更新掩码向对应从板下发寄存器快照
+// 参数：argument - 未使用
+// 返回值：无，任务持续运行
 void Task_SlaveDispatch_Entry(void *argument)
 {
+    (void)argument;
     for(;;)
     {
         osSemaphoreAcquire(Sem_NewSlaveCmd, osWaitForever);
-
-        Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
-        osDelay(15);
-        Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
+        uint16_t commands[10];
+        taskENTER_CRITICAL();
+        uint8_t board_mask = s_slave_dispatch_mask;
+        s_slave_dispatch_mask = 0U;
+        memcpy(commands, &Reg[4], sizeof(commands));
+        taskEXIT_CRITICAL();
+        if ((board_mask & 0x01U) != 0U) {
+            Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, commands);
+        }
+        if ((board_mask & 0x03U) == 0x03U) osDelay(15);
+        if ((board_mask & 0x02U) != 0U) {
+            Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &commands[5]);
+        }
     }
 }
 
@@ -630,28 +671,60 @@ void Task_IR_Process_Entry(void *argument)
 /*                   HAL 硬件中断回调接管                       */
 /* ========================================================== */
 
+// HAL_UARTEx_RxEventCallback：只把USART1完整DMA事件交付给上位机任务
+// 参数：huart - 触发串口；Size - 本次接收长度
+// 返回值：无，半传输通知不作为完整请求
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-    if (huart->Instance == USART2)
+    if (huart->Instance == USART1 && Sem_Uart1_RxIdle != NULL &&
+        HAL_UARTEx_GetRxEventType(huart) != HAL_UART_RXEVENT_HT &&
+        Size > 0U && Size <= sizeof(modbus2.rcbuf))
     {
-        modbus2.recount = Size;
-        osSemaphoreRelease(Sem_Uart2_RxIdle);
+        modbus2.recount = (uint8_t)Size;
+        modbus2.reflag = 1U;
+        osSemaphoreRelease(Sem_Uart1_RxIdle);
     }
 }
 
-/**
- * @brief CAN RX FIFO0 中断回调 → 推入队列
- */
+// HAL_UART_TxCpltCallback：只释放UART4反馈发送，保留其他串口控制链路
+// 参数：huart - 完成发送的串口
+// 返回值：无
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART4) Uart4Telemetry_OnTxComplete();
+}
+
+// HAL_UART_ErrorCallback：分离UART4发送异常和USART1接收恢复请求
+// 参数：huart - 发生错误的串口
+// 返回值：无，恢复操作交由任务执行
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART4) {
+        Uart4Telemetry_OnTxError();
+    } else if (huart->Instance == USART1 && Sem_Uart1_RxIdle != NULL) {
+        s_pc_rx_error = 1U;
+        osSemaphoreRelease(Sem_Uart1_RxIdle);
+    }
+}
+
+// HAL_CAN_RxFifo0MsgPendingCallback：按CAN实例分流并排空本次接收FIFO
+// 参数：hcan - 触发接收的CAN外设
+// 返回值：无；CAN2反馈绝不进入CAN1动作队列
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
     CAN_RxHeaderTypeDef rxHeader;
-    App_CAN_Msg_t rxMsg;
-
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxMsg.data) == HAL_OK)
-    {
-        rxMsg.id = rxHeader.StdId;
-        rxMsg.len = rxHeader.DLC;
-        osMessageQueuePut(Queue_CAN_Rx, &rxMsg, 0, 0);
+    while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) != 0U) {
+        App_CAN_Msg_t rxMsg = {0};
+        if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxMsg.data) != HAL_OK) break;
+        if (hcan->Instance == CAN2) {
+            SlaveFeedback_OnCanRx(&rxHeader, rxMsg.data, HAL_GetTick());
+        } else if (hcan->Instance == CAN1 && Queue_CAN_Rx != NULL &&
+                   rxHeader.IDE == CAN_ID_STD && rxHeader.RTR == CAN_RTR_DATA &&
+                   rxHeader.StdId == CAN_HAND_ID && rxHeader.DLC >= 1U && rxHeader.DLC <= 8U) {
+            rxMsg.id = rxHeader.StdId;
+            rxMsg.len = (uint8_t)rxHeader.DLC;
+            osMessageQueuePut(Queue_CAN_Rx, &rxMsg, 0, 0);
+        }
     }
 }
 

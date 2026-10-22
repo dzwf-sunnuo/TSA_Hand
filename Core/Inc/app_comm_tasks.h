@@ -70,6 +70,11 @@ typedef struct {
 /* 全局通信任务初始化函数 */
 void App_Comm_Init(void);
 
+// App_RequestSlaveDispatch：通知分发任务仅向被写入的从板发送命令
+// 参数：board_mask - bit0对应一号板，bit1对应二号板
+// 返回值：无，多次通知合并为各板最新的寄存器命令
+void App_RequestSlaveDispatch(uint8_t board_mask);
+
 /* 统一动作分发器 (由 IR/CAN 任务调用) */
 void Action_Dispatch(const ActionCmd_t *cmd);
 

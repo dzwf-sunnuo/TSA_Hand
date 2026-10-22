@@ -46,6 +46,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/app_comm_tasks.c
+    Core/Src/slave_feedback.c
+    Core/Src/uart4_telemetry.c
     Hardware/Infrared1838.c
     Hardware/MyCan.c
     Hardware/rs485.c
@@ -72,6 +74,14 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
+    m
 
     # Add user defined libraries
+)
+
+# 生成 .bin 和 .hex 文件 (用于烧录)
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.bin
+    COMMAND ${CMAKE_OBJCOPY} -O ihex   $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.hex
+    COMMENT "生成烧录文件: ${CMAKE_PROJECT_NAME}.bin / ${CMAKE_PROJECT_NAME}.hex"
 )

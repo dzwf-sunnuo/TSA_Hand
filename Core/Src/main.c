@@ -21,7 +21,6 @@
 #include "cmsis_os.h"
 #include "can.h"
 #include "dma.h"
-#include "stm32f4xx_hal.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -32,6 +31,7 @@
 #include "rs485.h"        
 #include "Infrared1838.h" 
 #include "wrist.h"
+#include "MyCan.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -106,11 +106,13 @@ int main(void)
   MX_TIM3_Init();
   MX_CAN1_Init();
   MX_UART4_Init();
+  MX_CAN2_Init();
+  MX_UART5_Init();
   /* USER CODE BEGIN 2 */
-   modbus2_Init(); // 初始化 Modbus2 数据结构
-   modbus2_Send_Byte(0x55); // 发送测试字节，确认串口通信正常
+   modbus2_Init(); // 初始化USART1上位机协议和上报配置，业务串口不发送测试字节。
   /* 注意：HAL_UARTEx_ReceiveToIdle_DMA 已移至 App_Comm_Init() 中，
            确保在信号量创建之后再启动 DMA 接收 */
+  // CAN启动及有效心跳统一由App_Comm_Init负责，避免初始化前提交发送。
   /* USER CODE END 2 */
 
   /* Init scheduler */
