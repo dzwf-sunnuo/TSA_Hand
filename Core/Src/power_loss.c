@@ -1,5 +1,6 @@
 #include "power_loss.h"
 #include "Motor.h"
+#include "rs485.h"
 #include "stm32f4xx_hal.h"
 
 // ================================================================
@@ -62,9 +63,12 @@ int PL_Is12VAlive(void)
 //  紧急停机 (掉电时: 关闭 PWM 输出, 保留编码器, 关 LED)
 //  直接停 TIM1/TIM5 的 PWM 通道, 断电后即使编码器转动也不生成 PWM
 // ================================================================
+// PL_EmergencyStop：掉电时关闭三路有效电机PWM，原motor0保持停用
+// 参数：无
+// 返回值：无，编码器及原关节标定索引不变
 void PL_EmergencyStop(void)
 {
-    for (int i = 0; i < Motor_Num; i++) {
+    for (int i = MOTOR_FIRST_INDEX; i < Motor_Num; i++) {
         HAL_TIM_PWM_Stop(motor_hw_map[i].pwm_tim, motor_hw_map[i].pwm_ch1);
         HAL_TIM_PWM_Stop(motor_hw_map[i].pwm_tim, motor_hw_map[i].pwm_ch2);
     }
@@ -76,9 +80,12 @@ void PL_EmergencyStop(void)
 //  恢复运行 (12V 恢复时: 重启 PWM + 开 LED)
 //  Motor_Control_Loop 在下个 10ms 周期自动恢复 PID 输出
 // ================================================================
+// PL_Resume：恢复三路有效电机输出和LED，不启动原motor0
+// 参数：无
+// 返回值：无，下一控制周期按每路独立使能执行
 void PL_Resume(void)
 {
-    for (int i = 0; i < Motor_Num; i++) {
+    for (int i = MOTOR_FIRST_INDEX; i < Motor_Num; i++) {
         HAL_TIM_PWM_Start(motor_hw_map[i].pwm_tim, motor_hw_map[i].pwm_ch1);
         HAL_TIM_PWM_Start(motor_hw_map[i].pwm_tim, motor_hw_map[i].pwm_ch2);
     }

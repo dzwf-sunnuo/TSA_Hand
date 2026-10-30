@@ -8,7 +8,7 @@
 #include "sensor_feedback.h"
 
 /* 系统常量定义 */
-#define Motor_Num 4             // 系统管理的电机总数 (食指、中指、无名指、小指)
+#define Motor_Num 4             // 原硬件编号的存储跨度；只运行motor1～3，motor0已从控制和输出调度移除
 #define Hall_Num 4              // 关节霍尔传感器数量
 #define CalibrationLEN 2        // 传感器标定点数量 (用于线性插值)
 

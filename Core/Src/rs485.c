@@ -11,8 +11,8 @@
 // rcbuf由USART1 RX DMA直接写入，因此整个modbus结构体保留在普通SRAM，禁止加CCMRAM属性。
 MODBUS modbus;
 __CCM_RAM_DATA uint16_t Reg[100] = {0}; // CPU访问的保持寄存器，与DMA接收缓冲分开存放
-__CCM_RAM_DATA volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[5..13] 时置 1
-__CCM_RAM_DATA volatile uint8_t admittance_mode_restart = 0; // bit0=模式6，bit1=模式7
+__CCM_RAM_DATA volatile uint8_t pid_params_dirty = 0;  // Modbus 写 Reg[32..40] 时置 1
+__CCM_RAM_DATA volatile uint8_t motor_mode_restart_mask = 0; // 每位仅通知对应电机，不重置其他电机
 __CCM_RAM_DATA volatile uint8_t experiment_event = 0; // 1=实验开始，2=实验停止
 __CCM_RAM_DATA volatile uint8_t experiment_mode = 0;
 __CCM_RAM_DATA volatile uint8_t experiment_output_limit = 0;
@@ -20,20 +20,10 @@ __CCM_RAM_DATA volatile uint8_t experiment_output_limit = 0;
 #define EXPERIMENT_TARGET_TURNS 60U
 #define EXPERIMENT_RETURN_COMMAND 0x0064U
 
-// UpdateAdmittanceRestartFlag：检测模式寄存器写入并生成导纳重新启动事件
-// 参数：reg_value - 本次写入Reg[4]的完整16位值
-// 返回值：无
-static void UpdateAdmittanceRestartFlag(uint16_t reg_value)
-{
-    if (reg_value == 0x0601U) {
-        admittance_mode_restart |= 0x01U;
-    } else if (reg_value == 0x0701U) {
-        admittance_mode_restart |= 0x02U;
-    }
-}
+__CCM_RAM_DATA static uint16_t last_motor_mode[MOTOR_CONTROL_COUNT] = {0};
 
 // IsExperimentOutputLimit：判断输出限幅是否属于五档减速比实验
-// 参数：output_limit - Reg[0]低字节中的输出限幅百分比
+// 参数：output_limit - Reg[MOTOR_TARGET_REG(MOTOR_FIRST_INDEX)]低字节中的输出限幅百分比
 // 返回值：uint8_t - 属于20、40、60、80、100时返回1，否则返回0
 static uint8_t IsExperimentOutputLimit(uint8_t output_limit)
 {
@@ -47,13 +37,13 @@ static uint8_t IsExperimentOutputLimit(uint8_t output_limit)
 // 返回值：无
 static void UpdateExperimentEvent(void)
 {
-    uint8_t mode = (uint8_t)(Reg[4] >> 8);
-    uint8_t enable = (uint8_t)(Reg[4] & 0xFFU);
-    uint8_t target_turns = (uint8_t)(Reg[0] >> 8);
-    uint8_t output_limit = (uint8_t)(Reg[0] & 0xFFU);
+    uint8_t mode = (uint8_t)(Reg[MOTOR_MODE_REG(MOTOR_FIRST_INDEX)] >> 8);
+    uint8_t enable = (uint8_t)(Reg[MOTOR_MODE_REG(MOTOR_FIRST_INDEX)] & 0xFFU);
+    uint8_t target_turns = (uint8_t)(Reg[MOTOR_TARGET_REG(MOTOR_FIRST_INDEX)] >> 8);
+    uint8_t output_limit = (uint8_t)(Reg[MOTOR_TARGET_REG(MOTOR_FIRST_INDEX)] & 0xFFU);
 
     if ((mode == 1U || mode == 3U) && enable != 0U &&
-        Reg[0] == EXPERIMENT_RETURN_COMMAND) {
+        Reg[MOTOR_TARGET_REG(MOTOR_FIRST_INDEX)] == EXPERIMENT_RETURN_COMMAND) {
         experiment_event = 2U;
     } else if ((mode == 1U || mode == 3U) && enable != 0U &&
                target_turns == EXPERIMENT_TARGET_TURNS &&
@@ -101,14 +91,11 @@ void Modbus_Init(void)
 {
     memset(&modbus, 0, sizeof(MODBUS));
     
-    // 初始化寄存器默认值
-    Reg[0] = 0x0000; 
-    Reg[1] = 0x0000; 
-    Reg[2] = 0x0000; 
-    Reg[3] = 0x0000; 
-    Reg[4] = 0x0000; 
-
-    // 三路采集与CAN上报均默认开启，电机运动使能仍由Reg[4]独立控制。
+    // 复位只清零本板有效电机的目标/模式，全部输出默认失能。
+    memset(Reg, 0, sizeof(Reg));
+    memset(last_motor_mode, 0, sizeof(last_motor_mode));
+    motor_mode_restart_mask = 0U;
+    // 采集及CAN开关不改变任何单路电机的独立使能。
     Reg[TACTILE_REG_ENABLE] = TACTILE_DEFAULT_ENABLE;
     Reg[CAN_REPORT_REG_ENABLE] = CAN_REPORT_DEFAULT_ENABLE;
     Reg[CAN_REPORT_REG_FREQUENCY] = CAN_REPORT_DEFAULT_FREQUENCY;
@@ -306,15 +293,42 @@ static void Modbus_SendException(const uint8_t *buffer, uint8_t exception)
     Modbus_SendResponse(3U);
 }
 
-// Modbus_AfterWrite：在原子写入完成后处理PID、模式与实验事件
+// Modbus_AfterWrite：原子转换模式5/7零角度回零命令，再处理PID、模式与实验事件
 // 参数：address - 起始地址；count - 寄存器数量
 // 返回值：无；调用者仍在短临界区中，函数不等待任何硬件
 static void Modbus_AfterWrite(uint16_t address, uint16_t count)
 {
     uint16_t end = address + count;
     if (address <= PID_REG_KD_SPD && end > PID_REG_KP_POS) pid_params_dirty = 1U;
-    if (address <= 4U && end > 4U) UpdateAdmittanceRestartFlag(Reg[4]);
-    if (address == 0U || (address <= 4U && end > 4U)) UpdateExperimentEvent();
+    for (uint8_t slot = 0U; slot < MOTOR_CONTROL_COUNT; ++slot) {
+        uint8_t motor_index = (uint8_t)(slot + MOTOR_FIRST_INDEX);
+        uint16_t target_address = MOTOR_TARGET_REG(motor_index);
+        uint16_t mode_address = MOTOR_MODE_REG(motor_index);
+        bool target_written = address <= target_address && end > target_address;
+        bool mode_written = address <= mode_address && end > mode_address;
+        bool zero_angle_return = false;
+        // 只检查本帧触及的目标/模式对，避免写PID或导纳参数时影响其他电机。
+        // 精确匹配目标0000与模式0501/0701，转换为模式1零圈目标及原100%限幅，不再限制为5度。
+        if ((target_written || mode_written) && Reg[target_address] == 0x0000U &&
+            (Reg[mode_address] == 0x0501U || Reg[mode_address] == 0x0701U)) {
+            Reg[target_address] = 0x0064U;
+            Reg[mode_address] = 0x0101U;
+            zero_angle_return = true;
+        }
+        // 即使本帧只写目标，只要转换改变了模式，也必须同步模式历史和该路重启事件。
+        // 转换与原写入同处短临界区，控制任务只能读到完整的0064、0101。
+        if (mode_written || zero_angle_return) {
+            uint16_t mode_word = Reg[mode_address];
+            // 连续快帧重复相同模式不反复清零积分；单独写模式可明确解除本路超力锁定。
+            bool explicit_restart = count == 1U;
+            bool mode_changed = (mode_word >> 8) != (last_motor_mode[slot] >> 8);
+            if ((explicit_restart || mode_changed) && (mode_word & 0xFFU) != 0U) {
+                motor_mode_restart_mask |= (uint8_t)(1U << motor_index);
+            }
+            last_motor_mode[slot] = mode_word;
+        }
+    }
+    if (address < 2U) UpdateExperimentEvent();
 }
 
 // Modbus_Func3：读取保持寄存器，并限制响应长度以保护200字节发送缓冲

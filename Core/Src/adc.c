@@ -28,9 +28,7 @@ ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
 
-// MX_ADC1_Init：配置四路关节ADC，84周期采样及有限批次DMA
-// 参数：无
-// 返回值：无
+/* ADC1 init function */
 void MX_ADC1_Init(void)
 {
 
@@ -152,9 +150,6 @@ void MX_ADC2_Init(void)
 
 }
 
-// HAL_ADC_MspInit：配置ADC引脚与DMA，ADC1使用正常模式有限批次
-// 参数：adcHandle - ADC句柄，ADC2保持原有独立配置
-// 返回值：无
 void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
 {
 
@@ -188,7 +183,7 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
     hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;
     hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
     hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
-    hdma_adc1.Init.Mode = DMA_NORMAL; // 采满60点后不循环覆盖原始缓冲
+    hdma_adc1.Init.Mode = DMA_NORMAL;
     hdma_adc1.Init.Priority = DMA_PRIORITY_LOW;
     hdma_adc1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
     if (HAL_DMA_Init(&hdma_adc1) != HAL_OK)

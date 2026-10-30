@@ -17,21 +17,29 @@
 // LED 闪烁参数: 4 次翻转 = 2 闪, 总时长 = BLINK_PERIOD × 4
 #define LED_BLINK_PERIOD_MS  50U
 
-// PID 参数 Modbus 寄存器索引 (Reg[5..13])
-#define PID_REG_KP_POS  5
-#define PID_REG_KI_POS  6
-#define PID_REG_KD_POS  7
-#define PID_REG_KP_ANG  8
-#define PID_REG_KI_ANG  9
-#define PID_REG_KD_ANG  10
-#define PID_REG_KP_SPD  11
-#define PID_REG_KI_SPD  12
-#define PID_REG_KD_SPD  13
+// 每个有效电机使用两个连续寄存器：目标在前，模式/独立使能在后。
+// 二号板保留原硬件编号motor1～3，一号板使用motor0～3；无motor0控制占位。
+#define MOTOR_FIRST_INDEX 1U
+#define MOTOR_CONTROL_COUNT 3U
+#define MOTOR_CONTROL_REG_COUNT (2U * MOTOR_CONTROL_COUNT)
+#define MOTOR_TARGET_REG(index) (2U * ((uint16_t)(index) - MOTOR_FIRST_INDEX))
+#define MOTOR_MODE_REG(index) (MOTOR_TARGET_REG(index) + 1U)
+
+// PID参数迁移至0x20～0x28，避免与交错控制区0x00～0x07重叠。
+#define PID_REG_KP_POS  32U
+#define PID_REG_KI_POS  33U
+#define PID_REG_KD_POS  34U
+#define PID_REG_KP_ANG  35U
+#define PID_REG_KI_ANG  36U
+#define PID_REG_KD_ANG  37U
+#define PID_REG_KP_SPD  38U
+#define PID_REG_KI_SPD  39U
+#define PID_REG_KD_SPD  40U
 
 // 导纳控制参数寄存器 (case 6)
 #define ADM_REG_K  15    // 接触刚度 ×1000
 #define ADM_REG_B  16    // 回弹刚度 ×1000
-#define ADM_REG_DAMP 17  // 虚拟阻尼 ×1000 (16=0.016, 越小响应越快)
+#define ADM_REG_DAMP 17  // 虚拟阻尼 ×1000 (25=0.025, 越小响应越快)
 
 // SPI采集位按实际电机编号定义：bit1/2/3分别为中指/无名指/小指。
 // bit0及其他位不绑定传感器，采集开关不控制电机运动使能。
@@ -78,7 +86,8 @@ typedef struct
 
 extern MODBUS modbus;
 extern uint16_t Reg[100];
-extern volatile uint8_t pid_params_dirty; /* PID 寄存器 (Reg[5..13]) 被写时置 1 */
+extern volatile uint8_t pid_params_dirty; /* PID 寄存器 (Reg[32..40]) 被写时置 1 */
+extern volatile uint8_t motor_mode_restart_mask; // 按原电机编号记录待处理的导纳重启事件
 extern osTimerId_t ledBlinkTimerHandle;    /* RS485 收发触发的 LED 闪烁定时器 */
 extern osMessageQueueId_t modbusRxQueueHandle;
 extern osSemaphoreId_t uartTxSemHandle; // UART 发送完成信号量
