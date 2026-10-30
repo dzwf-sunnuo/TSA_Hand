@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/app_comm_tasks.c
     Core/Src/slave_feedback.c
     Core/Src/uart4_telemetry.c
+    Core/Src/uart4_modbus.c
     Hardware/Infrared1838.c
     Hardware/MyCan.c
     Hardware/rs485.c

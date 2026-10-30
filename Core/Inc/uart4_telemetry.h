@@ -4,7 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define UART4_TELEMETRY_FRAME_SIZE 25U
+// 原25字节数据帧后追加单个换行符LF（0x0A），DMA一次发送完整26字节。
+#define UART4_TELEMETRY_FRAME_SIZE 26U
 #define UART4_TELEMETRY_INVALID_VALUE 0xFFFFU
 
 // Uart4TelemetryStats_t：保存上报结果，不向业务串口打印调试文本

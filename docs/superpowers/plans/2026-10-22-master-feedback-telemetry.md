@@ -1,5 +1,7 @@
 # 主板串口分工、CAN2反馈与UART4上报改造计划
 
+> 2026-10-26协议更新：正式版保留当前工作区的`BB`帧头、5Hz默认频率，并在`AA`后追加单个LF（`0A`），整帧26字节，继续使用DMA。下文为原实施计划记录，最新对外格式以`docs/Master_Feedback_Protocol.md`为准。
+
 > 状态：用户已批准并实施，已编译，设备联调待用户进行。日期：2026-10-22。
 > 执行说明：后续实现按任务复选框推进；采用代理执行时使用 `superpowers:subagent-driven-development`，本会话直接执行时使用 `superpowers:executing-plans`。本次按用户要求直接实施，不运行编译以外的测试。
 

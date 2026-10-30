@@ -1,6 +1,10 @@
 # FR_Hand_m — 灵巧手主板 (FreeRTOS)
 
+> 2026-10-29：控制接口已改为七电机独立目标/模式，共14寄存器。新地址映射、旧参数迁移和完整报文以[独立模式协议](docs/Per_Motor_Control_Protocol.md)为准；本文下方旧“四目标＋公共模式”及旧配置地址属于历史版本，不能直接用于新版固件。
+
 FreeRTOS 实时操作系统驱动的灵巧手主板固件。运行于 STM32F407VETx (Cortex-M4F)，通过 CAN 总线 / 红外遥控 / Modbus RTU (RS485) 三种方式接收控制指令，经 RS485 总线分发给手指从机板，同时直接控制两个手腕推杆电机。
+
+2026-10-31新增统一导纳参数入口：主板`Reg[44..46]`（`0x002C～0x002E`）依次为接触刚度、回弹刚度、阻尼，默认整数50、200、25，实际值0.05、0.2、0.025。写任一项后异步同步两从板完整三项，不重发目标或模式；既有控制寄存器地址和命令不变。USART1及UART4写入方式和带CRC示例见[主板统一导纳参数协议](docs/Master_Admittance_Parameters.md)。
 
 ## 硬件平台
 
@@ -15,10 +19,12 @@ FreeRTOS 实时操作系统驱动的灵巧手主板固件。运行于 STM32F407V
 | 手指板通信 | RS485 (USART2, 230400) — Modbus RTU 主机 (slave 0x01/0x02) |
 | 手腕电机 | USART3 + USART6 (921600) — 推杆电机直驱 |
 | 红外遥控 | TIM3 CH3 (PC8) — NEC 协议 |
-| 汇总反馈 | UART4 (230400) — DMA发送，默认10 Hz、25字节二进制帧，帧头FF、帧尾AA |
+| 蓝牙控制与汇总反馈 | UART4 (230400) — 循环DMA接收无应答MODBUS，与USART1共用寄存器；DMA发送26字节反馈，默认5 Hz，BB开头、AA 0A结尾 |
 | 语音接口预留 | UART5 — 当前不开发业务 |
 
-角度、五指合力、状态位及上报配置详见[主板控制与反馈通信协议](docs/Master_Feedback_Protocol.md)。新增`Reg[30..33]`依次为上报使能、频率、法向/切向阈值×10、合力门槛×10，默认值依次为1、10、10、30。
+角度、五指合力、状态位及上报配置详见[主板控制与反馈通信协议](docs/Master_Feedback_Protocol.md)。新增`Reg[30..33]`依次为上报使能、频率、法向/切向阈值×10、合力门槛×10，默认值依次为1、5、10、30。
+
+UART4控制沿用地址`0x10`及MODBUS CRC，使用长度与CRC组帧，不以蓝牙IDLE作为命令结束。所有命令无MODBUS应答，USART1应答保留。接入细节见[UART4控制方案与实施记录](docs/UART4_Modbus_Control_Plan.md)；配套上位机位于`D:\project\Paper\tools\手部反馈上位机`。
 
 ## 目录结构
 
@@ -84,7 +90,7 @@ cmake --build build/Debug
 | `Task_IR_Process` | Normal | 事件驱动 | `Sem_IR_Ready` | 红外遥控按键解析 |
 | `Task_SlaveDispatch` | BelowNormal | 事件驱动 | `Sem_NewSlaveCmd` | 向手指从板分发 485 指令 |
 | `SlaveFeedback` | Normal | CAN2接收队列 | 独立反馈队列 | 解码两板角度和力，分别维护有效性与时间戳 |
-| `Uart4Telemetry` | BelowNormal | 默认100 ms | 周期及配置通知 | 从缓存组装25字节反馈，以UART4中断发送 |
+| `Uart4Telemetry` | BelowNormal | 默认200 ms | 周期及配置通知 | 从缓存组装26字节反馈，以UART4 DMA发送 |
 
 ### 消息流
 
@@ -137,7 +143,7 @@ FR_Hand_m (本机) ──USART2 / MODBUS──→ 两块触觉手指从板
      │                              ├── slave 0x01 = 拇指motor0/1/2、食指motor3
      │                              └── slave 0x02 = 中指motor1、无名指motor2、小指motor3
      ├── CAN2 ←── 两块从板反馈 (1 Mbit/s)
-     ├── UART4 ──→ 六角度、五合力、状态 (默认10 Hz)
+     ├── UART4 ──→ 六角度、五合力、状态 (默认5 Hz)
      │
      ├── CAN1 ←─→  上位机 / 手柄
      ├── IR   ←──  遥控器 (NEC)

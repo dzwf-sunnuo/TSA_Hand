@@ -75,6 +75,11 @@ void App_Comm_Init(void);
 // 返回值：无，多次通知合并为各板最新的寄存器命令
 void App_RequestSlaveDispatch(uint8_t board_mask);
 
+// App_RequestAdmittanceDispatch：通知分发任务把完整统一导纳参数发送到两块从板
+// 参数：无，参数由任务从主板Reg[44..46]一次取得快照
+// 返回值：无，多次通知合并为最新参数，不触发运动命令或导纳重启
+void App_RequestAdmittanceDispatch(void);
+
 /* 统一动作分发器 (由 IR/CAN 任务调用) */
 void Action_Dispatch(const ActionCmd_t *cmd);
 

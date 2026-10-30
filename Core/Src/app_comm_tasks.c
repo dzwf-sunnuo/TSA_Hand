@@ -9,6 +9,7 @@
 #include "MyCan.h"
 #include "slave_feedback.h"
 #include "uart4_telemetry.h"
+#include "uart4_modbus.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -36,6 +37,7 @@ osSemaphoreId_t Sem_NewMotionCmd;      // finger_motion 打断信号
 osMessageQueueId_t Queue_CAN_Rx;
 osMessageQueueId_t Queue_WristCmd;   // 手腕命令
 static uint8_t s_slave_dispatch_mask;
+static uint8_t s_admittance_dispatch_pending; // 独立记录参数待发送，不复用运动更新位。
 static volatile uint8_t s_pc_rx_error;
 
 /* ================== 系统全局状态 ================== */
@@ -334,49 +336,43 @@ void CAN_Msg_MapToAction(const App_CAN_Msg_t *msg, ActionCmd_t *cmd)
  *  0x15=全电机正转, 0x16=全电机反转, 0x17=编码器清零, 0x18=推杆定位
  * ================================================================ */
 
+// Can_SetMotorCommands：将CAN七目标转换为七组独立目标/模式并通知分发任务
+// 参数：msg - data[1..7]依次为三个拇指自由度、食指、中指、无名指、小指；mode_word - 模式与使能
+// 返回值：无，两块从板使用同一原子寄存器快照
+static void Can_SetMotorCommands(const App_CAN_Msg_t *msg, uint16_t mode_word)
+{
+    taskENTER_CRITICAL();
+    for (uint8_t motor = 0U; motor < 7U; ++motor) {
+        uint16_t target = msg == NULL ? 0x0064U : ((uint16_t)msg->data[1U + motor] << 8) | 0x64U;
+        Reg[HAND_CONTROL_BASE + 2U * motor] = target;
+        Reg[HAND_CONTROL_BASE + 2U * motor + 1U] = mode_word;
+    }
+    taskEXIT_CRITICAL();
+    App_RequestSlaveDispatch(0x03U);
+}
+
+// Can_AllMotors：七路按CAN给定圈数分别设置正转角度模式
+// 参数：msg - 完整七路CAN目标
+// 返回值：无
 static void Can_AllMotors(const App_CAN_Msg_t *msg)
 {
-    // data[1..7] = 关节 01-07 圈数, 速度 0x64, 正转 (mode=1)
-    Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
-    Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
-    Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
-    Reg[7] = ((uint16_t)msg->data[7] << 8) | 0x64;
-    Reg[8] = 0x0101;
-    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
-    osDelay(15);
-    Reg[9]  = ((uint16_t)msg->data[4] << 8) | 0x64;
-    Reg[10] = ((uint16_t)msg->data[5] << 8) | 0x64;
-    Reg[11] = ((uint16_t)msg->data[6] << 8) | 0x64;
-    Reg[12] = ((uint16_t)msg->data[7] << 8) | 0x64;
-    Reg[13] = 0x0101;
-    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
+    Can_SetMotorCommands(msg, 0x0101U);
 }
 
+// Can_AllMotorsRev：七路按CAN给定圈数分别设置反转角度模式
+// 参数：msg - 完整七路CAN目标
+// 返回值：无
 static void Can_AllMotorsRev(const App_CAN_Msg_t *msg)
 {
-    // 同 0x15, mode=3 反转
-    Reg[4] = ((uint16_t)msg->data[1] << 8) | 0x64;
-    Reg[5] = ((uint16_t)msg->data[2] << 8) | 0x64;
-    Reg[6] = ((uint16_t)msg->data[3] << 8) | 0x64;
-    Reg[7] = ((uint16_t)msg->data[7] << 8) | 0x64;
-    Reg[8] = 0x0301;
-    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
-    osDelay(15);
-    Reg[9]  = ((uint16_t)msg->data[4] << 8) | 0x64;
-    Reg[10] = ((uint16_t)msg->data[5] << 8) | 0x64;
-    Reg[11] = ((uint16_t)msg->data[6] << 8) | 0x64;
-    Reg[12] = ((uint16_t)msg->data[7] << 8) | 0x64;
-    Reg[13] = 0x0301;
-    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
+    Can_SetMotorCommands(msg, 0x0301U);
 }
 
+// Can_ClearEncoders：给七个有效电机分别提交清零命令
+// 参数：无
+// 返回值：无，不再向二号板motor0发送占位数据
 static void Can_ClearEncoders(void)
 {
-    Reg[4] = 0x0064; Reg[5] = 0x0064; Reg[6] = 0x0064; Reg[7] = 0x0000; Reg[8] = 0x0401;
-    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, &Reg[4]);
-    osDelay(15);
-    Reg[9] = 0x0064; Reg[10] = 0x0064; Reg[11] = 0x0064; Reg[12] = 0x0064; Reg[13] = 0x0401;
-    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &Reg[9]);
+    Can_SetMotorCommands(NULL, 0x0401U);
 }
 
 static void Can_WristPos(const App_CAN_Msg_t *msg)
@@ -504,6 +500,17 @@ void App_RequestSlaveDispatch(uint8_t board_mask)
     if (Sem_NewSlaveCmd != NULL) (void)osSemaphoreRelease(Sem_NewSlaveCmd);
 }
 
+// App_RequestAdmittanceDispatch：合并统一导纳参数更新事件并唤醒原分发任务
+// 参数：无，主板参数已由公共MODBUS入口完成校验及原子提交
+// 返回值：无，后续写入由新的待发送事件保留，不覆盖正在发送的参数快照
+void App_RequestAdmittanceDispatch(void)
+{
+    taskENTER_CRITICAL();
+    s_admittance_dispatch_pending = 1U;
+    taskEXIT_CRITICAL();
+    if (Sem_NewSlaveCmd != NULL) (void)osSemaphoreRelease(Sem_NewSlaveCmd);
+}
+
 // App_Comm_Init：建立控制、反馈和上报任务，分别启动USART1及两路CAN
 // 参数：无，调度器启动前调用
 // 返回值：无，软件资源建立失败时进入项目统一错误处理
@@ -558,16 +565,19 @@ void App_Comm_Init(void)
 /*                   RTOS 任务实现                             */
 /* ========================================================== */
 
-// Task_ModbusPC_Entry：解析USART1完整请求，处理接收错误并恢复DMA接收
+// Task_ModbusPC_Entry：顺序处理USART1与UART4请求，共用寄存器及控制副作用
 // 参数：argument - 未使用
 // 返回值：无，任务持续运行
 void Task_ModbusPC_Entry(void *argument)
 {
     (void)argument;
+    Uart4Modbus_Init(Sem_Uart1_RxIdle);
     App_ModbusPC_StartReceive();
     for(;;)
     {
-        if (osSemaphoreAcquire(Sem_Uart1_RxIdle, 20U) == osOK) {
+        // 两路中断仅唤醒同一个任务，超时唤醒用于恢复DMA及清理蓝牙残片。
+        (void)osSemaphoreAcquire(Sem_Uart1_RxIdle, 5U);
+        if (s_pc_rx_error != 0U || modbus2.reflag != 0U) {
             if (s_pc_rx_error != 0U) {
                 (void)HAL_UART_AbortReceive(&huart1);
                 modbus2.reflag = 0U;
@@ -578,10 +588,11 @@ void Task_ModbusPC_Entry(void *argument)
             }
         }
         App_ModbusPC_StartReceive();
+        Uart4Modbus_Process();
     }
 }
 
-// Task_SlaveDispatch_Entry：按更新掩码向对应从板下发寄存器快照
+// Task_SlaveDispatch_Entry：分别消费运动更新和导纳参数更新，向从板发送独立寄存器快照
 // 参数：argument - 未使用
 // 返回值：无，任务持续运行
 void Task_SlaveDispatch_Entry(void *argument)
@@ -590,18 +601,32 @@ void Task_SlaveDispatch_Entry(void *argument)
     for(;;)
     {
         osSemaphoreAcquire(Sem_NewSlaveCmd, osWaitForever);
-        uint16_t commands[10];
+        uint16_t commands[HAND_CONTROL_COUNT];
+        uint16_t admittance[ADM_REG_COUNT];
         taskENTER_CRITICAL();
         uint8_t board_mask = s_slave_dispatch_mask;
+        uint8_t admittance_pending = s_admittance_dispatch_pending;
         s_slave_dispatch_mask = 0U;
-        memcpy(commands, &Reg[4], sizeof(commands));
+        s_admittance_dispatch_pending = 0U;
+        memcpy(commands, &Reg[HAND_CONTROL_BASE], sizeof(commands));
+        memcpy(admittance, &Reg[ADM_REG_MASTER_K_CONTACT], sizeof(admittance));
         taskEXIT_CRITICAL();
         if ((board_mask & 0x01U) != 0U) {
-            Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, commands);
+            Host_write16_slave(0x01, 0x10, 0x0000, HAND_BOARD1_COUNT, 2U * HAND_BOARD1_COUNT, commands);
         }
         if ((board_mask & 0x03U) == 0x03U) osDelay(15);
         if ((board_mask & 0x02U) != 0U) {
-            Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, &commands[5]);
+            Host_write16_slave(0x02, 0x10, 0x0000, HAND_BOARD2_COUNT, 2U * HAND_BOARD2_COUNT, &commands[HAND_BOARD1_COUNT]);
+        }
+        if (admittance_pending != 0U) {
+            // 原运动发送顺序与间隔保持现状；只有本批另有参数更新时才追加以下参数帧。
+            if (board_mask != 0U) osDelay(15);
+            Host_write16_slave(0x01U, 0x10U, ADM_REG_SLAVE_BASE, ADM_REG_COUNT,
+                2U * ADM_REG_COUNT, admittance);
+            osDelay(15); // 为一号板处理及回包留出与原双板发送相同的间隔。
+            Host_write16_slave(0x02U, 0x10U, ADM_REG_SLAVE_BASE, ADM_REG_COUNT,
+                2U * ADM_REG_COUNT, admittance);
+            osDelay(15); // 为二号板处理及回包留出间隔，再接收后续已排队的运动或参数事件。
         }
     }
 }
@@ -671,11 +696,15 @@ void Task_IR_Process_Entry(void *argument)
 /*                   HAL 硬件中断回调接管                       */
 /* ========================================================== */
 
-// HAL_UARTEx_RxEventCallback：只把USART1完整DMA事件交付给上位机任务
+// HAL_UARTEx_RxEventCallback：USART1交付原完整帧，UART4只交付连续字节块
 // 参数：huart - 触发串口；Size - 本次接收长度
-// 返回值：无，半传输通知不作为完整请求
+// 返回值：无；UART4的IDLE、半满和全满都不会被当作MODBUS帧结束
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
+    if (huart->Instance == UART4) {
+        Uart4Modbus_OnRxEvent();
+        return;
+    }
     if (huart->Instance == USART1 && Sem_Uart1_RxIdle != NULL &&
         HAL_UARTEx_GetRxEventType(huart) != HAL_UART_RXEVENT_HT &&
         Size > 0U && Size <= sizeof(modbus2.rcbuf))
@@ -694,13 +723,23 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == UART4) Uart4Telemetry_OnTxComplete();
 }
 
-// HAL_UART_ErrorCallback：分离UART4发送异常和USART1接收恢复请求
+// HAL_UART_ErrorCallback：分别请求UART4的RX恢复、TX恢复及USART1接收恢复
 // 参数：huart - 发生错误的串口
 // 返回值：无，恢复操作交由任务执行
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == UART4) {
-        Uart4Telemetry_OnTxError();
+        uint32_t errors = huart->ErrorCode;
+        bool rx_dma_error = huart->hdmarx != NULL &&
+                            HAL_DMA_GetError(huart->hdmarx) != HAL_DMA_ERROR_NONE;
+        bool tx_dma_error = huart->hdmatx != NULL &&
+                            HAL_DMA_GetError(huart->hdmatx) != HAL_DMA_ERROR_NONE;
+        if ((errors & (HAL_UART_ERROR_PE | HAL_UART_ERROR_NE |
+                       HAL_UART_ERROR_FE | HAL_UART_ERROR_ORE)) != 0U || rx_dma_error) {
+            Uart4Modbus_OnRxError();
+        }
+        // 接收的帧错误或溢出不能误停TX；只在TX DMA本身报错时恢复发送。
+        if (tx_dma_error) Uart4Telemetry_OnTxError();
     } else if (huart->Instance == USART1 && Sem_Uart1_RxIdle != NULL) {
         s_pc_rx_error = 1U;
         osSemaphoreRelease(Sem_Uart1_RxIdle);

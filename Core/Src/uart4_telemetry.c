@@ -30,6 +30,15 @@ static volatile uint8_t s_tx_busy;
 static volatile uint8_t s_tx_error;
 static uint32_t s_tx_start_ms;
 
+// Uart4Telemetry_TxDmaError：隔离发送DMA异常，防止HAL默认回调停止蓝牙接收。
+// 参数：hdma - UART4发送DMA句柄，仅用于HAL回调签名。
+// 返回值：无，由遥测任务同步终止并恢复TX，RX循环DMA继续运行。
+static void Uart4Telemetry_TxDmaError(DMA_HandleTypeDef *hdma)
+{
+    (void)hdma;
+    Uart4Telemetry_OnTxError();
+}
+
 // Uart4Telemetry_ReadConfig：在短临界区内读取四个配置寄存器
 // 参数：无
 // 返回值：本次配置快照
@@ -54,15 +63,15 @@ static void Uart4Telemetry_PutU16(uint8_t *out, uint16_t value)
     out[1] = (uint8_t)value;
 }
 
-// Uart4Telemetry_Encode：生成帧头、六路角度、五路合力、状态和帧尾
-// 参数：frame - 25字节输出区；snapshot - 反馈快照；config - 本帧配置
+// Uart4Telemetry_Encode：生成帧头、六路角度、五路合力、状态、帧尾和换行符
+// 参数：frame - 26字节输出区；snapshot - 反馈快照；config - 本帧配置
 // 返回值：无；无效角度和力编码为0xFFFF，对应力状态清零
 static void Uart4Telemetry_Encode(uint8_t frame[UART4_TELEMETRY_FRAME_SIZE],
                                  const SlaveFeedbackSnapshot_t *snapshot,
                                  const TelemetryConfig_t *config)
 {
     memset(frame, 0, UART4_TELEMETRY_FRAME_SIZE);
-    frame[0] = 0xFFU;
+    frame[0] = 0xBBU;
     for (uint8_t i = 0U; i < SLAVE_FEEDBACK_ANGLE_COUNT; ++i) {
         uint16_t angle = (snapshot->angle_valid_mask & (1U << i)) != 0U ?
                          snapshot->angle_tenths[i] : UART4_TELEMETRY_INVALID_VALUE;
@@ -86,6 +95,7 @@ static void Uart4Telemetry_Encode(uint8_t frame[UART4_TELEMETRY_FRAME_SIZE],
         Uart4Telemetry_PutU16(&frame[13U + 2U * i], force);
     }
     frame[24] = 0xAAU;
+    frame[25] = 0x0AU; // 帧尾AA之后追加单个LF换行符，前25字节字段位置保持原协议。
 }
 
 // Uart4Telemetry_Send：用任务互斥锁校验配置并提交整帧DMA发送，不屏蔽全局中断
@@ -98,7 +108,7 @@ static void Uart4Telemetry_Send(const TelemetryConfig_t *config)
     SlaveFeedback_GetSnapshot(&snapshot);
     Uart4Telemetry_Encode(frame, &snapshot, config);
     if (!Uart4Telemetry_LockConfig()) return;
-    // 与MODBUS配置提交串行化，锁只持有到DMA启动，不等待约1.085ms的线路发送。
+    // 与MODBUS配置提交串行化，锁只持有到DMA启动，不等待约1.128ms的26字节线路发送。
     if (Reg[UART4_REPORT_REG_ENABLE] == 1U &&
         Reg[UART4_REPORT_REG_FREQUENCY] == config->frequency &&
         Reg[UART4_REPORT_REG_RATIO] == config->ratio_tenths &&
@@ -114,6 +124,7 @@ static void Uart4Telemetry_Send(const TelemetryConfig_t *config)
             HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);
             HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&huart4, s_tx_buffer, sizeof(s_tx_buffer));
             if (status == HAL_OK) {
+                huart4.hdmatx->XferErrorCallback = Uart4Telemetry_TxDmaError;
                 // 一帧只需要DMA传输完成和UART线路发送完成，不需要半帧通知。
                 __HAL_DMA_DISABLE_IT(huart4.hdmatx, DMA_IT_HT);
             } else {

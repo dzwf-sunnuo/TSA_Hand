@@ -105,30 +105,30 @@ void finger_motion(uint8_t num, uint16_t speed)
     uint8_t i = 0;
     if (num == COUNT_NUMBERS) {
         for (i = 0; i < 13; i++) {
-            Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, Action1_ban1[i]);
-            Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, Action1_ban2[i]);
+            Host_write_legacy_action(0x01, Action1_ban1[i]);
+            Host_write_legacy_action(0x02, Action1_ban2[i]);
             HAL_Delay(speed);
             if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
         }
     } else if (num == CONTINUOUS_BENDING) {
         for (i = 0; i < 9; i++) {
-            Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, Action2_ban1[i]);
+            Host_write_legacy_action(0x01, Action2_ban1[i]);
             osDelay(15); // 主从板间短暂延时，确保动作同步
-            Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, Action2_ban2[i]);
+            Host_write_legacy_action(0x02, Action2_ban2[i]);
             osDelay(speed);
             if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
         }
     } else if (num == OTHER_MOTION) {
         for (i = 0; i < 6; i++) {
-            Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, Action3_ban1[i]);
-            Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, Action3_ban2[i]);
+            Host_write_legacy_action(0x01, Action3_ban1[i]);
+            Host_write_legacy_action(0x02, Action3_ban2[i]);
             osDelay(speed);
             if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
         }
     } else if (num == CONTINUOUS_FISTING) {
         for (i = 0; i < 3; i++) {
-            Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, Action4_ban1[i]);
-            Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, Action4_ban2[i]);
+            Host_write_legacy_action(0x01, Action4_ban1[i]);
+            Host_write_legacy_action(0x02, Action4_ban2[i]);
             HAL_Delay(speed);
             if (osSemaphoreAcquire(Sem_NewMotionCmd, 0) == osOK) break;
         }
@@ -326,19 +326,25 @@ static const struct {
 };
 #define SINGLE_ACTION_COUNT (sizeof(single_action_table) / sizeof(single_action_table[0]))
 
+// finger_single_action：转换旧预设表并分别向两块从板发送独立目标/模式帧
+// 参数：num - 预设动作索引，越界时不发送
+// 返回值：无，两块板沿用原15毫秒发送间隔
 void finger_single_action(uint16_t num)
 {
     if (num >= SINGLE_ACTION_COUNT) return;
 
-    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, single_action_table[num].ban1);
+    Host_write_legacy_action(0x01, single_action_table[num].ban1);
     osDelay(15);
-    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, single_action_table[num].ban2);
+    Host_write_legacy_action(0x02, single_action_table[num].ban2);
 }
 
+// finger_reset：把原复位动作表转换为一号板8寄存器及二号板6寄存器
+// 参数：无
+// 返回值：无，二号板原motor0占位由适配函数丢弃
 static void finger_reset(void){
-    Host_write16_slave(0x01, 0x10, 0x0000, 0x0005, 0x0A, single_action_table[0x00].ban1);
+    Host_write_legacy_action(0x01, single_action_table[0x00].ban1);
     osDelay(15);
-    Host_write16_slave(0x02, 0x10, 0x0000, 0x0005, 0x0A, single_action_table[0x00].ban2);
+    Host_write_legacy_action(0x02, single_action_table[0x00].ban2);
 
 }
 void finger_wrist_show(void){
