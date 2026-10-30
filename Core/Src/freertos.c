@@ -146,9 +146,6 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
   * @param  None
   * @retval None
   */
-// MX_FREERTOS_Init：创建现有控制任务与静态CAN反馈任务及同步对象
-// 参数：无
-// 返回值：无
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
 
@@ -347,7 +344,7 @@ void vSystemMonitorTask(void *argument)
     // 100ms周期监控，同时输出减速比实验CSV数据
     osDelayUntil(PreviousWakeTime + 250);
     PreviousWakeTime = osKernelGetTickCount();
-
+/*
     // 12V 主电掉电检测 (ADC2 IN4, 100ms 轮询 + 2 次消抖 = 200ms)
     if (!PL_Is12VAlive()) {
       if (!pl_was_lost) {
@@ -362,6 +359,7 @@ void vSystemMonitorTask(void *argument)
       PL_Resume();         // 开 LED
       pl_was_lost = 0;
     }
+      
       // 先输出实验事件，再输出同周期数据，便于上位机准确切分采集区间
       /*if (experiment_event == 1U) {
         printf("EXPERIMENT_START,1,%u,%u\r\n",
@@ -372,7 +370,10 @@ void vSystemMonitorTask(void *argument)
         printf("EXPERIMENT_STOP\r\n");
         experiment_event = 0U;
       }*/
-      Print_Motor_Status(0U, 101); // 默认输出拇指motor0与NSS1力缓存的FF数据帧
+      /*Print_Motor_Status(0U, 6); // 默认输出拇指motor0与NSS1力缓存的FF数据帧
+      Print_Motor_Status(1U, 6); // 默认输出拇指motor0与NSS1力缓存的FF数据帧
+      Print_Motor_Status(2U, 6); // 默认输出拇指motor0与NSS1力缓存的FF数据帧
+      Print_Motor_Status(3U, 6); // 默认输出拇指motor0与NSS1力缓存的FF数据帧*/
     }
 
   }
