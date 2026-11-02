@@ -307,16 +307,19 @@ static void Modbus_AfterWrite(uint16_t address, uint16_t count)
         bool target_written = address <= target_address && end > target_address;
         bool mode_written = address <= mode_address && end > mode_address;
         bool zero_angle_return = false;
+        uint8_t requested_mode = (uint8_t)(Reg[mode_address] >> 8);
+        uint8_t speed_percent = (uint8_t)(Reg[mode_address] & 0xFFU);
         // 只检查本帧触及的目标/模式对，避免写PID或导纳参数时影响其他电机。
-        // 精确匹配目标0000与模式0501/0701，转换为模式1零圈目标及原100%限幅，不再限制为5度。
+        // 模式5/7零角度且速度非零时，退出关节控制并按相同速度返回编码器累计零位。
         if ((target_written || mode_written) && Reg[target_address] == 0x0000U &&
-            (Reg[mode_address] == 0x0501U || Reg[mode_address] == 0x0701U)) {
-            Reg[target_address] = 0x0064U;
+            (requested_mode == 5U || requested_mode == 7U) && speed_percent != 0U) {
+            if (speed_percent > MOTOR_SPEED_PERCENT_MAX) speed_percent = MOTOR_SPEED_PERCENT_MAX;
+            Reg[target_address] = (uint16_t)speed_percent; // 模式1高字节零圈、低字节保留限速百分比。
             Reg[mode_address] = 0x0101U;
             zero_angle_return = true;
         }
         // 即使本帧只写目标，只要转换改变了模式，也必须同步模式历史和该路重启事件。
-        // 转换与原写入同处短临界区，控制任务只能读到完整的0064、0101。
+        // 转换与原写入同处短临界区，控制任务只能读到完整的零圈目标及0101模式。
         if (mode_written || zero_angle_return) {
             uint16_t mode_word = Reg[mode_address];
             // 连续快帧重复相同模式不反复清零积分；单独写模式可明确解除本路超力锁定。

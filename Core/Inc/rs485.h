@@ -25,6 +25,9 @@
 #define MOTOR_TARGET_REG(index) (2U * ((uint16_t)(index) - MOTOR_FIRST_INDEX))
 #define MOTOR_MODE_REG(index) (MOTOR_TARGET_REG(index) + 1U)
 
+// 模式5/7低字节为最大速度百分比：0停止，1～100直接生效，超过100按100执行。
+#define MOTOR_SPEED_PERCENT_MAX 100U
+
 // PID参数迁移至0x20～0x28，避免与交错控制区0x00～0x07重叠。
 #define PID_REG_KP_POS  32U
 #define PID_REG_KI_POS  33U

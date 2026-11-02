@@ -257,6 +257,27 @@ static void Motor_ResetPid(uint8_t index)
     }
 }
 
+// Motor_RunPositionPid：按模式5/7的速度百分比及编码器零位下限执行关节位置环
+// 参数：index - 原硬件电机编号；speed_percent - 模式低字节，0停止，1～100为百分比
+// 返回值：float - 限速后的电机目标转速，采用模式1既有的速度换算尺度
+static float Motor_RunPositionPid(uint8_t index, uint8_t speed_percent)
+{
+    if (speed_percent > MOTOR_SPEED_PERCENT_MAX) {
+        speed_percent = MOTOR_SPEED_PERCENT_MAX; // 超范围输入按100%处理，避免突破约定上限。
+    }
+    // 与模式1的“目标低字节”使用同一尺度：50%对应Real_MaxSpeed乘50。
+    float max_speed = Real_MaxSpeed * (float)speed_percent;
+    PID_Increment_Struct *position_pid = &PID_Position[index];
+    // 以累计编码器角度为零位依据：到达零位或已经越过零位时，禁止生成负方向目标速度。
+    // 不修改实际累计角度，保留越界反馈，并允许正方向运动离开下限。
+    position_pid->OutMin = motor[index].CurrentAngle <= 0.0f ? 0.0f : -max_speed;
+    position_pid->OutMax = max_speed;
+    // 降速时先收紧旧输出，PID_Increment再将本周期输出及Out_Last一起钳位，防止积分堆积。
+    if (position_pid->Out_Last > max_speed) position_pid->Out_Last = max_speed;
+    else if (position_pid->Out_Last < position_pid->OutMin) position_pid->Out_Last = position_pid->OutMin;
+    return PID_Increment(position_pid, motor[index].CurrentPosition, motor[index].TargetPosition);
+}
+
 // Motor_ReadCommands：原子取得本周期全部有效电机目标、模式和独立重启事件
 // 参数：targets/modes - 按原硬件编号存放的输出数组
 // 返回值：每一位对应原电机编号的重启事件，事件只被当前控制周期消费一次
@@ -447,7 +468,7 @@ void Motor_Control_Loop(void)
                     // 通过线性插值将目标物理角度转换为目标 ADC 值
                     motor[i].TargetPosition = lineInterp(JointAngle[i], ADValue[i], CalibrationLEN, target_joint_angle, InterpolationFlag[i]);
                     // 位置环计算 -> 得到目标速度
-                    motor[i].TargetSpeed = PID_Increment(&PID_Position[i], motor[i].CurrentPosition, motor[i].TargetPosition);
+                    motor[i].TargetSpeed = Motor_RunPositionPid((uint8_t)i, io_flag);
 
                     // 死区处理：ADC 误差在 5 以内则停止, 同时复位 PID 状态防止重启时跳变
                     if (PID_Position[i].Error_Last1 <= 5.0f && PID_Position[i].Error_Last1 >= -5.0f) {
@@ -557,7 +578,7 @@ void Motor_Control_Loop(void)
                             }
                         }
 
-                        // 锁定期间持续执行5.0°安全目标，直到上位机再次写入0x0701
+                        // 锁定期间持续执行5.0°安全目标，直到上位机按协议重新启用模式7。
                         if (mode7_force_locked[tactile_index] != 0U) {
                             float target_angle = 5.0f;
                             if (target_angle < 5.0f)  target_angle = 5.0f;
@@ -587,8 +608,8 @@ void Motor_Control_Loop(void)
                             CalibrationLEN, target_angle, InterpolationFlag[i]);
                     }
                     // 全电机位置环闭环 (ADC 反馈)
-                    motor[i].TargetSpeed = PID_Increment(&PID_Position[i],
-                        motor[i].CurrentPosition, motor[i].TargetPosition);
+                    // 基准跟踪、受力退让与松手回弹都使用该关节独立设置的最大速度。
+                    motor[i].TargetSpeed = Motor_RunPositionPid((uint8_t)i, io_flag);
 
                     // 死区处理: ADC 误差 ≤5 则停止
                     if (PID_Position[i].Error_Last1 <= 5.0f && PID_Position[i].Error_Last1 >= -5.0f) {
@@ -614,6 +635,13 @@ void Motor_Control_Loop(void)
             }
 
             /* 2.3 内环计算 (速度环) */
+            // 模式5/7到达编码器累计零位后，同时禁止负方向驱动输出，避免速度环旧积分继续反转。
+            // 每周期重新设置下限，回到正角度或切换其他模式时恢复原有双向速度调节。
+            bool joint_zero_limited = (mode == 5U || mode == 7U) && motor[i].CurrentAngle <= 0.0f;
+            PID_Speed[i].OutMin = joint_zero_limited ? 0.0f : -1000.0f;
+            if (PID_Speed[i].Out_Last < PID_Speed[i].OutMin) {
+                PID_Speed[i].Out_Last = PID_Speed[i].OutMin; // 同步清除被禁止的负向累积输出。
+            }
             int16_t set_speed = (int16_t)PID_Increment(&PID_Speed[i], motor[i].CurrentSpeed, motor[i].TargetSpeed);
             
             // 输出限幅：PWM 对应占空比范围限制在 [-1000, 1000]
